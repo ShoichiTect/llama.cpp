@@ -1591,10 +1591,17 @@ private:
                             f_sim_best, slot_prompt_similarity, f_keep);
                 }
 
-                // if we are about to lose a large portion of the existing context - save it in the prompt cache
-                if (f_keep < 0.5f) {
-                    update_cache = true;
-                }
+                // Always consult the prompt cache, even when most of the current slot state can be
+                // kept. With several conversations alternating in the same slot, the slot usually
+                // holds the state of the *other* conversation, which shares a long common prefix
+                // (e.g. the system prompt) but diverges early - keeping only that prefix. A cached
+                // state of the incoming conversation may allow keeping far more tokens, but the
+                // lookup used to be skipped in exactly that case (f_keep >= 0.5), and the state of
+                // the short conversation was never saved either.
+                //
+                // This is safe: server_prompt_cache::load() ignores entries with f_keep < 0.25 and
+                // only replaces the current prompt when an entry improves BOTH f_keep and f_sim.
+                update_cache = true;
             }
         }
 
