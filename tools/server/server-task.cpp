@@ -1790,33 +1790,83 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
+// number of tokens that can actually be reused when restoring `prompt` (the current slot state
+// or a cached entry) for a request whose common prefix with it is `lcp`.
+//
+// - if the prompt is fully contained in the new one, nothing has to be rolled back, so all of it
+//   is reusable
+// - without checkpoints the memory can be rolled back to an arbitrary position, so the whole
+//   common prefix is reusable
+// - otherwise (hybrid/recurrent memory such as qwen3.5/3.6/3.8) the restored state is usable only
+//   up to the newest context checkpoint at or below the divergence point - this is what the slot
+//   falls back to instead of reprocessing from scratch
+static int64_t server_prompt_cache_n_reusable(const server_prompt & prompt, int lcp) {
+    if (lcp >= (int) prompt.tokens.size()) {
+        return lcp;
+    }
+
+    if (prompt.checkpoints.empty()) {
+        return lcp;
+    }
+
+    int64_t res = 0;
+
+    for (const auto & ckpt : prompt.checkpoints) {
+        if (ckpt.n_tokens <= lcp) {
+            res = std::max(res, ckpt.n_tokens);
+        }
+    }
+
+    return res;
+}
+
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
     float f_sim_best  = float(lcp_best) / tokens_new.size();
 
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    // how much of the slot's own state would actually be reused if we kept it
+    int64_t n_reuse_best = server_prompt_cache_n_reusable(prompt, lcp_best);
+
+    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f, n_reuse = %lld\n",
+            f_keep_best, f_sim_best, (long long) n_reuse_best);
 
     auto it_best = states.end();
 
-    // find the most similar cached prompt, that would also preserve the most context
+    // find the cached prompt that leaves the least work for the new request
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
         const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
 
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+        // tokens that could actually be restored from this entry (bounded by its checkpoints)
+        const int64_t n_reuse_cur = server_prompt_cache_n_reusable(it->prompt, lcp_cur);
 
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
+        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f, n_reuse = %lld\n",
+                it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur, (long long) n_reuse_cur);
+
+        // don't trash large prompts for a marginal gain
+        if (f_keep_cur < 0.25f && n_reuse_cur <= n_reuse_best) {
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
-            f_keep_best = f_keep_cur;
-            f_sim_best  = f_sim_cur;
+        // pick the entry that leaves the least work for the new prompt, i.e. maximize the number
+        // of reused tokens (not f_sim/f_keep ratios):
+        //
+        //  - the old rule required a candidate to improve BOTH f_keep and f_sim over the running
+        //    best. with several conversations in the same slot, they all share a long prefix
+        //    (system prompt) so a short entry always has f_keep close to 1.0, while any longer
+        //    entry is below that no matter how much more of the new prompt it covers. the result
+        //    depended on the iteration order and the short entry systematically won (#28276).
+        //  - lcp alone is not enough either: for hybrid/recurrent memory the restored state is
+        //    usable only up to a checkpoint, so an entry with a larger lcp but no checkpoint below
+        //    the divergence point can be worse than a shorter entry that has one (#26198).
+        if (n_reuse_best < n_reuse_cur) {
+            n_reuse_best = n_reuse_cur;
+            f_keep_best  = f_keep_cur;
+            f_sim_best   = f_sim_cur;
 
             it_best = it;
         }
