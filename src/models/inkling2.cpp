@@ -179,6 +179,12 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
     return out;
 }
 
+// GGML_METAL_PROFILE 的な ablation: INKLING2_ABL=noconv,noctrl,... で部品を外して計測する
+static bool inkling2_ablate(const char * name) {
+    static const char * env = getenv("INKLING2_ABL");
+    return env && strstr(env, name) != nullptr;
+}
+
 // the norm is per state, so the normalized blocks are built once and extended by one block at a time
 ggml_tensor * llama_model_inkling2::graph::normed_states(const std::vector<ggml_tensor *> & blocks, size_t n) {
     if (n == 0) {
@@ -205,6 +211,10 @@ ggml_tensor * llama_model_inkling2::graph::normed_states(const std::vector<ggml_
 
 // attention over the depth: mix the earlier block outputs and cur with learned queries
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
+    if (inkling2_ablate("nomix")) {
+        return ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    }
+
     // [blocks[n - 1], ..., blocks[0], cur]
     ggml_tensor * states = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), 1e-6f);
     if (ggml_tensor * earlier = normed_states(blocks, blocks.size())) {
@@ -237,6 +247,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     if (dynamic) {
         // the taps first, so that the convolution stays one run of nodes
         ggml_build_forward_expand(gf, dynamic);
+    }
+
+    if (inkling2_ablate("noconv")) {
+        return cur;
     }
 
     // one node for the taps, the dynamic taps, the residual and the scale; the history is read directly,
@@ -281,6 +295,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
+    if (inkling2_ablate("noctrl")) {
+        return cur;
+    }
+
     // one node for rms_norm(cur) || rms_norm(message)
     ggml_tensor * gate = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 2*cur->ne[0], cur->ne[1]);
     gate->op     = GGML_OP_INKLING2_GATE;
@@ -393,7 +411,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     }
 
     // self-attention
-    {
+    if (!inkling2_ablate("noattn")) {
         ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
         ggml_tensor * Kcur = convolve(build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
                 is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
@@ -424,12 +442,17 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         // project r on the bias table, the attention gathers it by distance: [n_head, extent + 1, n_tokens]
         // the last bucket is a zero pad, for the cells that are farther than the extent
-        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+        ggml_tensor * table = inkling2_ablate("norel")
+            ? nullptr
+            : ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+
+        if (table) {
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
         table = ggml_sub(ctx0, table, sinks);
         table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
-        cb(table, "rel_bias", il);
+        }
+        if (table) cb(table, "rel_bias", il);
 
         // the zero sink is the same for every layer with the same head count
         ggml_tensor *& zero = zero_sinks[n_head];
@@ -466,6 +489,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     }
     cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
 
+    if (inkling2_ablate("nomoe")) {
+        cur = ffn_inp;
+    } else
     cur = build_moe_ffn(cur,
             layer.ffn_gate_inp,
             nullptr,
