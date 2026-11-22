@@ -234,7 +234,9 @@ struct ggml_metal_kargs_inkling2_clip {
 // inkling2: situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
 struct ggml_metal_kargs_inkling2_situ {
     int32_t ne0;
+    int32_t ncol;   // ne0/4 when the float4 path is usable, else ne0
     int32_t nrows;
+    int32_t v4;
     int64_t nb1_g;
     int64_t nb1_u;
     float   beta;
@@ -256,6 +258,8 @@ struct ggml_metal_kargs_inkling2_gate {
 struct ggml_metal_kargs_inkling2_ctrl {
     int32_t ne0;
     int32_t ne1;
+    int32_t ncol;   // ne0/4 when the float4 path is usable, else ne0
+    int32_t v4;
     int64_t nb1_cur;
     int64_t nb1_msg;
     int64_t nb1_gain;
@@ -270,6 +274,7 @@ struct ggml_metal_kargs_inkling2_relbias {
     int32_t ne1;
     int32_t ne2;
     int32_t nth_t;
+    int32_t e_chunk;
     int64_t nb1_bias;
     int64_t nb1_r;
     int64_t nb2_r;

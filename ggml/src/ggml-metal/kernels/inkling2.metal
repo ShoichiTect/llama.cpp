@@ -121,22 +121,56 @@ kernel void kernel_inkling2_ctrl(
         device const float * forget,
         device       float * out,
         uint gid [[thread_position_in_grid]]) {
-    const int64_t ch = (int64_t) gid % args.ne0;
-    const int64_t t  = (int64_t) gid / args.ne0;
+    const int64_t ch = (int64_t) gid % args.ncol;
+    const int64_t t  = (int64_t) gid / args.ncol;
     if (t >= args.ne1) {
         return;
     }
 
-    const device float * pc = (device const float *) ((device const char *) cur    + ch*4 + t*args.nb1_cur);
-    const device float * pm = (device const float *) ((device const char *) msg    + ch*4 + t*args.nb1_msg);
-    const device float * pa = (device const float *) ((device const char *) gain   + ch*4 + t*args.nb1_gain);
-    const device float * pf = (device const float *) ((device const char *) forget + ch*4 + t*args.nb1_forget);
+    float c[4];
+    float m[4];
+    float a[4];
+    float f[4];
 
-    const float      c = pc[0];
-    volatile float   p = tanh(pf[0])*c;   // the volatile stops the fma contraction
-    const float      q = tanh(pa[0])*pm[0];
+    if (args.v4) {
+        const int64_t off = ch*16 + t*args.nb1_cur;
+        const float4 cv = *(device const float4 *) ((device const char *) cur + off);
+        c[0] = cv.x; c[1] = cv.y; c[2] = cv.z; c[3] = cv.w;
 
-    out[gid] = (c - p) + q;
+        const float4 mv = *(device const float4 *) ((device const char *) msg + ch*16 + t*args.nb1_msg);
+        m[0] = mv.x; m[1] = mv.y; m[2] = mv.z; m[3] = mv.w;
+
+        const float4 av = *(device const float4 *) ((device const char *) gain + ch*16 + t*args.nb1_gain);
+        a[0] = av.x; a[1] = av.y; a[2] = av.z; a[3] = av.w;
+
+        const float4 fv = *(device const float4 *) ((device const char *) forget + ch*16 + t*args.nb1_forget);
+        f[0] = fv.x; f[1] = fv.y; f[2] = fv.z; f[3] = fv.w;
+    } else {
+        const device float * pc = (device const float *) ((device const char *) cur    + ch*4 + t*args.nb1_cur);
+        const device float * pm = (device const float *) ((device const char *) msg    + ch*4 + t*args.nb1_msg);
+        const device float * pa = (device const float *) ((device const char *) gain   + ch*4 + t*args.nb1_gain);
+        const device float * pf = (device const float *) ((device const char *) forget + ch*4 + t*args.nb1_forget);
+        for (int i = 0; i < 4; ++i) {
+            c[i] = pc[i]; m[i] = pm[i]; a[i] = pa[i]; f[i] = pf[i];
+        }
+    }
+
+    // the formula is the same expression per lane, so the vectorized path stays bit-identical
+    float o[4];
+    for (int i = 0; i < 4; ++i) {
+        volatile float p = tanh(f[i])*c[i];   // the volatile stops the fma contraction
+        const float    q = tanh(a[i])*m[i];
+        o[i] = (c[i] - p) + q;
+    }
+
+    if (args.v4) {
+        *(device float4 *) (out + gid*4) = float4(o[0], o[1], o[2], o[3]);
+    } else {
+        device float * po = out + (int64_t) args.ne0*t + ch*4;
+        for (int i = 0; i < 4 && ch*4 + i < args.ne0; ++i) {
+            po[i] = o[i];
+        }
+    }
 }
 
 // the relative bias table: out[h, e, t] = sum_i bias[i, e]*r[i, h, t] - sink[h, t]
@@ -160,10 +194,18 @@ kernel void kernel_inkling2_relbias(
         return;
     }
 
+    // the e range of this threadgroup: tiling e is what keeps decode alive (one token used to be a
+    // single threadgroup of 128 threads looping 1025 times, which is pure DRAM latency)
+    const int64_t e0 = (int64_t) tgpig.x*args.e_chunk;
+    const int64_t e1 = min((int64_t) args.ne1, e0 + args.e_chunk);
+    if (e0 >= e1) {
+        return;
+    }
+
     const device float * pr = (device const float *) (r    + h*args.nb1_r    + t*args.nb2_r);
     const float          sv = *(device const float *) (sink + h*args.nb1_sink + t*args.nb2_sink);
 
-    device float * pd = (device float *) dst + h + args.ne0*args.ne1*t;
+    device float * pd = (device float *) dst + h + args.ne0*(e0 + (int64_t) args.ne1*t);
 
     if (args.n_rel == 16) {
         float4 rv0 = *(device const float4 *) (pr +  0);
@@ -171,7 +213,7 @@ kernel void kernel_inkling2_relbias(
         float4 rv2 = *(device const float4 *) (pr +  8);
         float4 rv3 = *(device const float4 *) (pr + 12);
 
-        for (int64_t e = 0; e < args.ne1; ++e, pd += args.ne0) {
+        for (int64_t e = e0; e < e1; ++e, pd += args.ne0) {
             float sum = 0.0f;
             if (e < args.n_ext) {
                 // bias is [n_rel, n_ext]: the row for e is n_rel contiguous floats at e*nb1
@@ -196,7 +238,7 @@ kernel void kernel_inkling2_relbias(
         rv[i] = pr[i];
     }
 
-    for (int64_t e = 0; e < args.ne1; ++e, pd += args.ne0) {
+    for (int64_t e = e0; e < e1; ++e, pd += args.ne0) {
         float sum = 0.0f;
         if (e < args.n_ext) {
             const device char * pb = bias + e*args.nb1_bias;
@@ -266,32 +308,58 @@ kernel void kernel_inkling2_gate(
 }
 
 // situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
-// the same expression order as the 9-node chain, so the result is bit-identical
+// the same expression order as the 9-node chain, so the result is bit-identical.
+// 4 lanes per thread when the strides allow a float4 load (the op is memory bound: it moves
+// ~28 MB per dispatch and was running at 16 GB/s with the scalar path)
 kernel void kernel_inkling2_situ(
         constant ggml_metal_kargs_inkling2_situ & args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
         uint gid [[thread_position_in_grid]]) {
-    const int64_t i0  = (int64_t) gid % args.ne0;
-    const int64_t row = (int64_t) gid / args.ne0;
+    const int64_t i0  = (int64_t) gid % args.ncol;
+    const int64_t row = (int64_t) gid / args.ncol;
     if (row >= args.nrows) {
         return;
     }
 
-    const device float * g = (device const float *) (src0 + row*args.nb1_g + i0*4);
-    const device float * u = (device const float *) (src1 + row*args.nb1_u + i0*4);
-    device       float * o = (device       float *) (dst  + (row*args.ne0 + i0)*4);
+    float g[4];
+    float u[4];
 
-    const float gv = g[0];
-
-    float act = args.beta*tanh(gv*(1.0f/args.beta)) * (1.0f/(1.0f + exp(-gv)));
-
-    if (args.lb > 0.0f) {
-        act *= args.lb*tanh(u[0]*(1.0f/args.lb));
+    if (args.v4) {
+        const float4 gv = *(device const float4 *) (src0 + row*args.nb1_g + i0*16);
+        g[0] = gv.x; g[1] = gv.y; g[2] = gv.z; g[3] = gv.w;
+        const float4 uv = *(device const float4 *) (src1 + row*args.nb1_u + i0*16);
+        u[0] = uv.x; u[1] = uv.y; u[2] = uv.z; u[3] = uv.w;
     } else {
-        act *= u[0];
+        const device float * pg = (device const float *) (src0 + row*args.nb1_g + i0*4);
+        const device float * pu = (device const float *) (src1 + row*args.nb1_u + i0*4);
+        for (int i = 0; i < 4; ++i) {
+            g[i] = pg[i]; u[i] = pu[i];
+        }
     }
 
-    o[0] = act;
+    float o[4];
+    for (int i = 0; i < 4; ++i) {
+        const float gv = g[i];
+
+        float act = args.beta*tanh(gv*(1.0f/args.beta)) * (1.0f/(1.0f + exp(-gv)));
+
+        if (args.lb > 0.0f) {
+            act *= args.lb*tanh(u[i]*(1.0f/args.lb));
+        } else {
+            act *= u[i];
+        }
+
+        o[i] = act;
+    }
+
+    if (args.v4) {
+        *(device float4 *) (dst + (int64_t) (row*args.ne0 + i0*4)*4) = float4(o[0], o[1], o[2], o[3]);
+    } else {
+        device float * po = (device float *) (dst + (int64_t) (row*args.ne0 + i0*4)*4);
+        for (int i = 0; i < 4 && i0*4 + i < args.ne0; ++i) {
+            po[i] = o[i];
+        }
+    }
 }
