@@ -362,6 +362,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_glu(ctx, idx);
             } break;
+        case GGML_OP_INKLING2_CTRL:
+            {
+                n_fuse = ggml_metal_op_inkling2_ctrl(ctx, idx);
+            } break;
         case GGML_OP_INKLING2_CONV:
             {
                 n_fuse = ggml_metal_op_inkling2_conv(ctx, idx);
@@ -1021,6 +1025,45 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, nk, nrows, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_inkling2_ctrl(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    ggml_metal_kargs_inkling2_ctrl args = {
+        /*.ne0       =*/ (int32_t) op->ne[0],
+        /*.ne1       =*/ (int32_t) op->ne[1],
+        /*.nb1_cur   =*/ (int64_t) op->src[0]->nb[1],
+        /*.nb1_msg   =*/ (int64_t) op->src[1]->nb[1],
+        /*.nb1_gain  =*/ (int64_t) op->src[2]->nb[1],
+        /*.nb1_forget =*/ (int64_t) op->src[3]->nb[1],
+    };
+
+    char base[256];
+    snprintf(base, 256, "kernel_inkling2_ctrl");
+
+    ggml_metal_pipeline_with_params pipeline = ggml_metal_library_get_pipeline(lib, base);
+    if (!pipeline.pipeline) {
+        pipeline = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+
+    const int nth = 256;
+    const int nt  = (int) ggml_nelements(op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         5);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (nt + nth - 1)/nth, 1, 1, nth, 1, 1);
 
     return 1;
 }

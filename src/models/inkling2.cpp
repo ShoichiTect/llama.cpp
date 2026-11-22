@@ -278,7 +278,14 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     gain   = ggml_tanh(ctx0, gain);
     forget = ggml_tanh(ctx0, forget);
 
-    ggml_tensor * out = ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
+    // one node for the elementwise tail
+    ggml_tensor * out = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cur->ne[0], cur->ne[1]);
+    out->op     = GGML_OP_INKLING2_CTRL;
+    out->src[0] = cur;
+    out->src[1] = message;
+    out->src[2] = gain;
+    out->src[3] = forget;
+    ggml_set_name(out, "inkling2_ctrl");
     ggml_build_forward_expand(gf, out);
 
     return out;

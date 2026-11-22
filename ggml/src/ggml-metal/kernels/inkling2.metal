@@ -77,3 +77,32 @@ kernel void kernel_inkling2_conv(
 
     out[ch + (int64_t) args.n_channels*t] = (cc[0] + acc)*args.scale;
 }
+
+// the controller tail: out = (cur - forget*cur) + gain*message
+// the tanhs stay as ggml nodes (their rounding must not change) and the fp
+// contraction is off so that the result stays bit-identical to the 3-node chain
+kernel void kernel_inkling2_ctrl(
+        constant ggml_metal_kargs_inkling2_ctrl & args,
+        device const float * cur,
+        device const float * msg,
+        device const float * gain,
+        device const float * forget,
+        device       float * out,
+        uint gid [[thread_position_in_grid]]) {
+    const int64_t ch = (int64_t) gid % args.ne0;
+    const int64_t t  = (int64_t) gid / args.ne0;
+    if (t >= args.ne1) {
+        return;
+    }
+
+    const device float * pc = (device const float *) ((device const char *) cur    + ch*4 + t*args.nb1_cur);
+    const device float * pm = (device const float *) ((device const char *) msg    + ch*4 + t*args.nb1_msg);
+    const device float * pa = (device const float *) ((device const char *) gain   + ch*4 + t*args.nb1_gain);
+    const device float * pf = (device const float *) ((device const char *) forget + ch*4 + t*args.nb1_forget);
+
+    const float      c = pc[0];
+    volatile float   p = pf[0]*c;   // the volatile stops the fma contraction
+    const float      q = pa[0]*pm[0];
+
+    out[gid] = (c - p) + q;
+}

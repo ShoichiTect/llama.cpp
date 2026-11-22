@@ -1892,6 +1892,32 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                     }
                 }
             } break;
+        case GGML_OP_INKLING2_CTRL:
+            {
+                const struct ggml_tensor * g = tensor->src[0]; // cur    [n_embd, n_tokens]
+                const struct ggml_tensor * m = tensor->src[1]; // message
+                const struct ggml_tensor * a = tensor->src[2]; // gain
+                const struct ggml_tensor * f = tensor->src[3]; // forget
+
+                const int64_t ne0 = tensor->ne[0];
+                const int64_t ne1 = tensor->ne[1];
+
+                const char * gd = (const char *) g->data;
+                const char * md = (const char *) m->data;
+                const char * ad = (const char *) a->data;
+                const char * fd = (const char *) f->data;
+                float      * od = (float *) tensor->data;
+
+                for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                    for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                        const float c = *(const float *) (gd + i0*sizeof(float) + i1*g->nb[1]);
+                        const float p = *(const float *) (fd + i0*sizeof(float) + i1*f->nb[1]);
+                        const float q = *(const float *) (ad + i0*sizeof(float) + i1*a->nb[1])*
+                                        *(const float *) (md + i0*sizeof(float) + i1*m->nb[1]);
+                        od[i0 + ne0*i1] = (c - p*c) + q;
+                    }
+                }
+            } break;
         case GGML_OP_INKLING2_CONV:
             {
                 const struct ggml_tensor * src0 = tensor->src[0]; // x     [ncs, n_channels, n_seqs]
@@ -2528,6 +2554,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_TOP_K:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:
+        case GGML_OP_INKLING2_CLIP:
+        case GGML_OP_INKLING2_CONV:
+        case GGML_OP_INKLING2_CTRL:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:

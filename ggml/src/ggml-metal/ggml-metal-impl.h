@@ -231,6 +231,16 @@ struct ggml_metal_kargs_inkling2_clip {
     float   threshold;
 };
 
+// inkling2: the controller tail: out = (cur - tanh(forget)*cur) + tanh(gain)*message
+struct ggml_metal_kargs_inkling2_ctrl {
+    int32_t ne0;
+    int32_t ne1;
+    int64_t nb1_cur;
+    int64_t nb1_msg;
+    int64_t nb1_gain;
+    int64_t nb1_forget;
+};
+
 // inkling2: the whole short-conv chain (taps + optional dynamic taps + residual + scale)
 struct ggml_metal_kargs_inkling2_conv {
     int32_t n_conv;
