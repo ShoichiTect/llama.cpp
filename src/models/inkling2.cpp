@@ -299,10 +299,7 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     ggml_build_forward_expand(gf, forget);
     ggml_build_forward_expand(gf, gain);
 
-    gain   = ggml_tanh(ctx0, gain);
-    forget = ggml_tanh(ctx0, forget);
-
-    // one node for the elementwise tail
+    // one node for the two tanhs and the elementwise tail
     ggml_tensor * out = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cur->ne[0], cur->ne[1]);
     out->op     = GGML_OP_INKLING2_CTRL;
     out->src[0] = cur;
@@ -434,7 +431,12 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
         cb(table, "rel_bias", il);
 
-        sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+        // the zero sink is the same for every layer with the same head count
+        ggml_tensor *& zero = zero_sinks[n_head];
+        if (!zero) {
+            zero = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+        }
+        sinks = zero;
 
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,

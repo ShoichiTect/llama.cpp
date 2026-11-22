@@ -1982,10 +1982,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 for (int64_t i1 = 0; i1 < ne1; ++i1) {
                     for (int64_t i0 = 0; i0 < ne0; ++i0) {
                         const float c = *(const float *) (gd + i0*sizeof(float) + i1*g->nb[1]);
-                        const float p = *(const float *) (fd + i0*sizeof(float) + i1*f->nb[1]);
-                        const float q = *(const float *) (ad + i0*sizeof(float) + i1*a->nb[1])*
-                                        *(const float *) (md + i0*sizeof(float) + i1*m->nb[1]);
-                        od[i0 + ne0*i1] = (c - p*c) + q;
+                        const float fv = tanhf(*(const float *) (fd + i0*sizeof(float) + i1*f->nb[1]));
+                        const float gv = tanhf(*(const float *) (ad + i0*sizeof(float) + i1*a->nb[1]));
+                        const float mv = *(const float *) (md + i0*sizeof(float) + i1*m->nb[1]);
+                        od[i0 + ne0*i1] = (c - fv*c) + gv*mv;
                     }
                 }
             } break;

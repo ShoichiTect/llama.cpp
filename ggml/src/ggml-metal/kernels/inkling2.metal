@@ -110,8 +110,8 @@ kernel void kernel_inkling2_conv_state(
     }
 }
 
-// the controller tail: out = (cur - forget*cur) + gain*message
-// the tanhs stay as ggml nodes (their rounding must not change) and the fp
+// the controller tail: out = (cur - tanh(forget)*cur) + tanh(gain)*message
+// the tanhs are the same MSL tanh that the ggml unary kernel uses, and the fp
 // contraction is off so that the result stays bit-identical to the 3-node chain
 kernel void kernel_inkling2_ctrl(
         constant ggml_metal_kargs_inkling2_ctrl & args,
@@ -133,8 +133,8 @@ kernel void kernel_inkling2_ctrl(
     const device float * pf = (device const float *) ((device const char *) forget + ch*4 + t*args.nb1_forget);
 
     const float      c = pc[0];
-    volatile float   p = pf[0]*c;   // the volatile stops the fma contraction
-    const float      q = pa[0]*pm[0];
+    volatile float   p = tanh(pf[0])*c;   // the volatile stops the fma contraction
+    const float      q = tanh(pa[0])*pm[0];
 
     out[gid] = (c - p) + q;
 }

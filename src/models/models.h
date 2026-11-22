@@ -2543,6 +2543,7 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * normed_states(const std::vector<ggml_tensor *> & blocks, size_t n);
 
         std::map<ggml_tensor *, ggml_tensor *>                normed_block;
+        std::map<int64_t, ggml_tensor *>                      zero_sinks;   // per n_head, shared by every layer
         std::map<std::vector<ggml_tensor *>, ggml_tensor *>   normed_prefix;
     };
 
