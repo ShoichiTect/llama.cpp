@@ -468,3 +468,108 @@ kernel void kernel_inkling2_mask(
         *(device float *) pd = v;
     }
 }
+
+// attention over the depth (the "mix"): the block outputs are the keys/values and the learned queries
+// select among them.  the generic graph did
+//     mul_mat(states, queries) -> soft_max -> cont(transpose(states)) -> mul_mat
+// and the transposing copy of the states alone was ~1.5 ms per layer.  here the states are read twice
+// in their natural layout instead, and the queries are broadcast out of the [n_embd, n_q, 1] tensor so
+// that the ggml_repeat of them (33 MB per layer) is gone too.
+//
+//   out[e, m, t] = sum_s p[s, m, t]*states[e, s, t]
+//   p[., m, t]   = softmax_s(scale*sum_k states[k, s, t]*q[k, m, t])
+//
+// one threadgroup per token: the scores take n_states*n_q dots, the softmax is over n_states, and the
+// output pass walks n_embd with all threads.
+kernel void kernel_inkling2_mix(
+        constant ggml_metal_kargs_inkling2_mix & args,
+        device const char * states,
+        device const char * query,
+        device       char * dst,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tiitg [[thread_position_in_threadgroup]]) {
+    const int32_t t  = (int32_t) tgpig.x;
+    const int32_t nh = args.nth;
+    const int32_t id = (int32_t) tiitg.x;
+
+    threadgroup float sh_p   [16*16];
+    threadgroup float sh_part[512];
+
+    const int32_t n_sm = args.n_states*args.n_q; // <= 256, checked on the host
+
+    device const char * st = states + (int64_t) t*args.nb2_s;
+
+    // scores: thread (s*n_q + m, chunk) accumulates a slice of the n_embd dot
+    const int32_t kch = args.kchunks;
+    if (id < n_sm*kch) {
+        const int32_t idx   = id / kch;
+        const int32_t chunk = id % kch;
+        const int32_t s     = idx / args.n_q;
+        const int32_t m     = idx % args.n_q;
+
+        device const char * pk = st + s*args.nb1_s;
+        device const char * pq = query + m*args.nb1_q + (int64_t) t*args.nb2_q;
+
+        const int32_t k0 = (int32_t) ((int64_t) args.n_embd*chunk/kch);
+        const int32_t k1 = (int32_t) ((int64_t) args.n_embd*(chunk + 1)/kch);
+
+        float4 acc = float4(0.0f);
+        int32_t k = k0;
+        for (; k + 4 <= k1; k += 4) {
+            const float4 a = *(device const float4 *) (pk + (int64_t) k*4);
+            const float4 b = *(device const float4 *) (pq + (int64_t) k*4);
+            acc.x += a.x*b.x; acc.y += a.y*b.y; acc.z += a.z*b.z; acc.w += a.w*b.w;
+        }
+        for (; k < k1; ++k) {
+            acc.x += (*(device const float *) (pk + (int64_t) k*4))*(*(device const float *) (pq + (int64_t) k*4));
+        }
+
+        sh_part[id] = acc.x + acc.y + acc.z + acc.w;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // reduce the chunks and, for the chunk-0 threads, do the softmax over the states
+    if (id < n_sm && kch > 1) {
+        float sum = sh_part[id*kch];
+        for (int32_t c = 1; c < kch; ++c) {
+            sum += sh_part[id*kch + c];
+        }
+        sh_p[id] = args.scale*sum;
+    }
+    if (kch == 1 && id < n_sm) {
+        sh_p[id] = args.scale*sh_part[id];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int32_t m = id; m < args.n_q; m += nh) {
+        float mx = -INFINITY;
+        for (int32_t s = 0; s < args.n_states; ++s) {
+            mx = max(mx, sh_p[s*args.n_q + m]);
+        }
+        float sum = 0.0f;
+        for (int32_t s = 0; s < args.n_states; ++s) {
+            const float v = exp(sh_p[s*args.n_q + m] - mx);
+            sh_p[s*args.n_q + m] = v;
+            sum += v;
+        }
+        for (int32_t s = 0; s < args.n_states; ++s) {
+            sh_p[s*args.n_q + m] /= sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // out: [n_embd, n_q, n_tokens], four channels at a time
+    const int32_t n_e4 = args.n_embd/4;
+    for (int32_t e4 = id; e4 < n_e4; e4 += nh) {
+        const int64_t eo = (int64_t) e4*16;
+        for (int32_t m = 0; m < args.n_q; ++m) {
+            float4 acc = float4(0.0f);
+            for (int32_t s = 0; s < args.n_states; ++s) {
+                const float  p = sh_p[s*args.n_q + m];
+                const float4 v = *(device const float4 *) (st + eo + s*args.nb1_s);
+                acc.x += p*v.x; acc.y += p*v.y; acc.z += p*v.z; acc.w += p*v.w;
+            }
+            *(device float4 *) (dst + eo + m*args.nb1_o + (int64_t) t*args.nb2_o) = acc;
+        }
+    }
+}

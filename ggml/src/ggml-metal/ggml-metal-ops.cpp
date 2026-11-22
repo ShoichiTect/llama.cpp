@@ -416,6 +416,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_inkling2_mask(ctx, idx);
             } break;
+        case GGML_OP_INKLING2_MIX:
+            {
+                n_fuse = ggml_metal_op_inkling2_mix(ctx, idx);
+            } break;
         case GGML_OP_INKLING2_CONV_STATE:
             {
                 n_fuse = ggml_metal_op_inkling2_conv_state(ctx, idx);
@@ -1298,6 +1302,63 @@ int ggml_metal_op_inkling2_relbias(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+
+int ggml_metal_op_inkling2_mix(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * states = op->src[0]; // [n_embd, n_states, n_tokens]
+    const ggml_tensor * query  = op->src[1]; // [n_embd, n_q, n_tokens]
+
+    float scale;
+    memcpy(&scale, op->op_params, sizeof(float));
+
+    const int32_t n_states = (int32_t) states->ne[1];
+    const int32_t n_q      = (int32_t) query->ne[1];
+    const int32_t n_sm     = n_states*n_q;
+
+    int32_t kch = 512/n_sm;
+    kch = kch < 1 ? 1 : (kch > 64 ? 64 : kch);
+    kch = kch > (int32_t) (states->ne[0]/4) ? (int32_t) (states->ne[0]/4) : kch;
+
+    const int32_t nth = n_sm*kch > 256 ? n_sm*kch : 256;
+
+    ggml_metal_kargs_inkling2_mix args = {
+        /*.n_embd   =*/ (int32_t) states->ne[0],
+        /*.n_states =*/ n_states,
+        /*.n_q      =*/ n_q,
+        /*.n_tokens =*/ (int32_t) states->ne[2],
+        /*.nth      =*/ nth,
+        /*.kchunks  =*/ kch,
+        /*.scale    =*/ scale,
+        /*.nb1_s    =*/ (int64_t) states->nb[1],
+        /*.nb2_s    =*/ (int64_t) states->nb[2],
+        /*.nb1_q    =*/ (int64_t) query->nb[1],
+        /*.nb2_q    =*/ (int64_t) (query->ne[2] > 1 ? query->nb[2] : 0),
+        /*.nb1_o    =*/ (int64_t) op->nb[1],
+        /*.nb2_o    =*/ (int64_t) op->nb[2],
+    };
+
+    ggml_metal_encoder_set_bytes  (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(states), 1);
+    ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(query),  2);
+    ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(op),     3);
+
+    char base[256];
+    snprintf(base, 256, "kernel_inkling2_mix");
+
+    ggml_metal_pipeline_with_params pipeline = ggml_metal_library_get_pipeline(lib, base);
+    if (!pipeline.pipeline) {
+        pipeline = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (int) op->ne[2], 1, 1, nth, 1, 1);
+
+    return 1;
+}
 
 int ggml_metal_op_inkling2_mask(ggml_metal_op_t ctx, int idx) {
     ggml_metal_op_t ctx_op = ctx;

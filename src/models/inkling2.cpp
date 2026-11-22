@@ -221,12 +221,28 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
         states = ggml_concat(ctx0, earlier, states, 1);
     }
 
-    ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
+    if (inkling2_ablate("oldmix") || states->ne[1] > 16 || query->ne[1] > 16) {
+        ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
 
-    ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
-    scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
+        ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
+        scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
-    return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
+        return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
+    }
+
+    // one node for the two matmuls, the softmax and the transpose; the queries stay broadcast
+    ggml_tensor * out = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens);
+    out->op     = GGML_OP_INKLING2_MIX;
+    out->src[0] = states;
+    out->src[1] = query;
+
+    const float mix_scale = 1.0f/sqrtf(n_embd);
+    memcpy(out->op_params, &mix_scale, sizeof(float));
+    ggml_set_name(out, "inkling2_mix");
+
+    ggml_build_forward_expand(gf, out);
+
+    return out;
 }
 
 // causal short convolution with a residual; dynamic adds input-dependent taps per head

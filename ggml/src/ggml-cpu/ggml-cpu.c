@@ -1989,6 +1989,67 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                     }
                 }
             } break;
+        case GGML_OP_INKLING2_MIX:
+            {
+                // out[e, m, t] = sum_s softmax_s(scale*sum_k states[k, s, t]*q[k, m, t])*states[e, s, t]
+                const struct ggml_tensor * states = tensor->src[0]; // [n_embd, n_states, n_tokens]
+                const struct ggml_tensor * query  = tensor->src[1]; // [n_embd, n_q, n_tokens]
+
+                const int64_t n_embd   = states->ne[0];
+                const int64_t n_states = states->ne[1];
+                const int64_t n_tokens = states->ne[2];
+                const int64_t n_q      = query->ne[1];
+
+                float scale;
+                memcpy(&scale, tensor->op_params, sizeof(float));
+
+                const char * st = (const char *) states->data;
+                const char * qd = (const char *) query->data;
+
+                const int ith = params->ith;
+                const int nth = params->nth;
+
+                float * p = (float *) malloc(sizeof(float)*n_states*n_q);
+
+                for (int64_t t = ith; t < n_tokens; t += nth) {
+                    for (int64_t m = 0; m < n_q; ++m) {
+                        const char * pq = qd + m*query->nb[1] + (query->ne[2] > 1 ? t*query->nb[2] : 0);
+
+                        float mx = -INFINITY;
+                        for (int64_t s = 0; s < n_states; ++s) {
+                            const char * pk = st + s*states->nb[1] + t*states->nb[2];
+                            float sum = 0.0f;
+                            for (int64_t k = 0; k < n_embd; ++k) {
+                                sum += *(const float *) (pk + k*states->nb[0]) * *(const float *) (pq + k*query->nb[0]);
+                            }
+                            p[s*n_q + m] = scale*sum;
+                            mx = MAX(mx, p[s*n_q + m]);
+                        }
+
+                        float sum = 0.0f;
+                        for (int64_t s = 0; s < n_states; ++s) {
+                            p[s*n_q + m] = expf(p[s*n_q + m] - mx);
+                            sum += p[s*n_q + m];
+                        }
+                        for (int64_t s = 0; s < n_states; ++s) {
+                            p[s*n_q + m] /= sum;
+                        }
+                    }
+
+                    for (int64_t m = 0; m < n_q; ++m) {
+                        float * po = (float *) ((char *) tensor->data + m*tensor->nb[1] + t*tensor->nb[2]);
+                        for (int64_t e = 0; e < n_embd; ++e) {
+                            float acc = 0.0f;
+                            for (int64_t s = 0; s < n_states; ++s) {
+                                acc += p[s*n_q + m]* *(const float *) (st + e*states->nb[0] + s*states->nb[1] + t*states->nb[2]);
+                            }
+                            po[e] = acc;
+                        }
+                    }
+                }
+
+                free(p);
+            } break;
         case GGML_OP_INKLING2_MASK:
             {
                 // out[kv, t, h, s] = bias[:, rel_pos[kv, t, s]] . r[:, h, t] - sink[h, t] + mask[kv, t, s]
@@ -2758,6 +2819,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_TOP_K:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:
+        case GGML_OP_INKLING2_MIX:
+            {
+                n_tasks = MIN(n_threads, node->ne[2]); // one task per token
+            } break;
         case GGML_OP_INKLING2_CLIP:
         case GGML_OP_INKLING2_CONV:
         case GGML_OP_INKLING2_CONV_STATE:

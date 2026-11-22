@@ -305,6 +305,23 @@ struct ggml_metal_kargs_inkling2_mask {
     int64_t nb3_m;
 };
 
+// inkling2: attention over the depth, out[e, m, t] = sum_s softmax_s(scale*sum_k states[k,s,t]*q[k,m,t])*states[e,s,t]
+struct ggml_metal_kargs_inkling2_mix {
+    int32_t n_embd;
+    int32_t n_states;
+    int32_t n_q;
+    int32_t n_tokens;
+    int32_t nth;
+    int32_t kchunks;
+    float   scale;
+    int64_t nb1_s;
+    int64_t nb2_s;
+    int64_t nb1_q;
+    int64_t nb2_q;
+    int64_t nb1_o;
+    int64_t nb2_o;
+};
+
 // inkling2: the whole short-conv chain (taps + optional dynamic taps + residual + scale)
 struct ggml_metal_kargs_inkling2_conv {
     int32_t n_conv;

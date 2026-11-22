@@ -116,6 +116,7 @@ int  ggml_metal_op_inkling2_conv_state(ggml_metal_op_t ctx, int idx);
 int  ggml_metal_op_inkling2_ctrl    (ggml_metal_op_t ctx, int idx);
 int  ggml_metal_op_inkling2_relbias (ggml_metal_op_t ctx, int idx);
 int  ggml_metal_op_inkling2_mask    (ggml_metal_op_t ctx, int idx);
+int  ggml_metal_op_inkling2_mix     (ggml_metal_op_t ctx, int idx);
 int  ggml_metal_op_inkling2_gate    (ggml_metal_op_t ctx, int idx);
 int  ggml_metal_op_inkling2_situ    (ggml_metal_op_t ctx, int idx);
 

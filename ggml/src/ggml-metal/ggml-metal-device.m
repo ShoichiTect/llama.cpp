@@ -1552,7 +1552,7 @@ static bool ggml_metal_supports_mul_mat_op(
 
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
     // デバッグ用: GGML_METAL_SKIP_INKLING2=CLIP,CONV,... で特定の融合 op を CPU に落とす
-    if (op->op >= GGML_OP_INKLING2_CLIP && op->op <= GGML_OP_INKLING2_MASK) {
+    if (op->op >= GGML_OP_INKLING2_CLIP && op->op <= GGML_OP_INKLING2_MIX) {
         const char * skip = getenv("GGML_METAL_SKIP_INKLING2");
         if (skip && skip[0]) {
             const char * name = ggml_op_name(op->op) + 9; // skip the "INKLING2_" prefix
@@ -1631,6 +1631,32 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return false;
         }
         if (op->type != mask->type) {
+            return false;
+        }
+        return true;
+    }
+
+    if (op->op == GGML_OP_INKLING2_MIX) {
+        const struct ggml_tensor * states = op->src[0];
+        const struct ggml_tensor * query  = op->src[1];
+        if (states->type != GGML_TYPE_F32 || query->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (states->ne[1] < 1 || states->ne[1] > 16 || query->ne[1] < 1 || query->ne[1] > 16) {
+            return false;
+        }
+        if (!ggml_is_contiguous(states) || op->ne[0] % 4 != 0) {
+            return false;
+        }
+        if (states->nb[0] != sizeof(float) || op->nb[0] != sizeof(float)) {
+            return false;
+        }
+        for (int i = 1; i < 3; ++i) {
+            if (states->nb[i] % 16 != 0 || op->nb[i] % 16 != 0) {
+                return false;
+            }
+        }
+        if (query->nb[0] != sizeof(float) || query->nb[1] % 16 != 0 || query->nb[2] % 16 != 0) {
             return false;
         }
         return true;
