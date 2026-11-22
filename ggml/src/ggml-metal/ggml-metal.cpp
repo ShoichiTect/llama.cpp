@@ -653,10 +653,15 @@ static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgrap
     ggml_metal_graph_optimize(ctx, cgraph);
 }
 
-// env override, for the n_cb sweep (GGML_METAL_N_CB=0..N)
+// number of command buffers that the Metal backend uses by default
+// measured on M1 Max with Inkling-2-Mini (tg128): 1 -> 20.33 t/s, 4 -> 20.81, 8 -> 20.85, 16 -> 20.96
+// prefill is unaffected, so a few extra encoder threads is free decode speed
+#define GGML_METAL_N_CB_DEFAULT 8
+
+// env override, for the n_cb sweep (GGML_METAL_N_CB=0..N); an empty value means "not set"
 static int ggml_backend_metal_n_cb_env(int n_cb) {
     const char * env = getenv("GGML_METAL_N_CB");
-    if (env) {
+    if (env && env[0] != '\0') {
         const int v = atoi(env);
         if (v >= 0) {
             return v;
@@ -716,7 +721,7 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, GGML_METAL_N_CB_DEFAULT);
 
     return backend;
 }
@@ -811,7 +816,7 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, GGML_METAL_N_CB_DEFAULT);
 
     return backend;
 
