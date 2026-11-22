@@ -239,27 +239,42 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         ggml_build_forward_expand(gf, dynamic);
     }
 
-    ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
-
-    ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
-    x = ggml_concat(ctx0, past, x, 0);
-
-    build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
-
-    // one node for the taps, the dynamic taps, the residual and the scale
+    // one node for the taps, the dynamic taps, the residual and the scale; the history is read directly,
+    // so the transpose/concat of the padded buffer is gone too
     ggml_tensor * out = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_channels, n_tokens);
     out->op     = GGML_OP_INKLING2_CONV;
-    out->src[0] = x;
+    out->src[0] = cur;
     out->src[1] = weight;
-    out->src[2] = cur;
+    out->src[2] = history;
     out->src[3] = dynamic;
 
-    const float conv_scale = 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1);
-    memcpy(out->op_params, &conv_scale, sizeof(conv_scale));
+    const float   conv_scale = 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1);
+    const int32_t hist_off   = (int32_t) offset;
+    memcpy(out->op_params,     &conv_scale, sizeof(float));
+    memcpy(out->op_params + 4, &hist_off,   sizeof(int32_t));
     ggml_set_name(out, "inkling2_conv");
 
-    // right after the state store, so that the convolution is one run of nodes that backends can fuse
+    // before the state store, so that the convolution still reads the old history
     ggml_build_forward_expand(gf, out);
+
+    if (cparams.n_rs_seq == 0) {
+        const size_t cell_offs = inp->mctx->get_head()*state->nb[1] + offset*(n_conv - 1)*ggml_element_size(state);
+
+        ggml_tensor * cell = ggml_view_2d(ctx0, state, (n_conv - 1)*n_channels, n_seqs, state->nb[1], cell_offs);
+        cell->op     = GGML_OP_INKLING2_CONV_STATE;
+        cell->src[0] = cur;
+        cell->src[1] = history;
+        memcpy(cell->op_params, &hist_off, sizeof(int32_t));
+        ggml_set_name(cell, "inkling2_conv_state");
+
+        ggml_build_forward_expand(gf, cell);
+    } else {
+        // the rollback path needs the padded buffer anyway
+        ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
+        ggml_tensor * x = ggml_concat(ctx0, past, ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs)), 0);
+
+        build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
+    }
 
     return out;
 }

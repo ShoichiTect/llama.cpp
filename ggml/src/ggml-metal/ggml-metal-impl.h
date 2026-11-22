@@ -265,14 +265,29 @@ struct ggml_metal_kargs_inkling2_ctrl {
 // inkling2: the whole short-conv chain (taps + optional dynamic taps + residual + scale)
 struct ggml_metal_kargs_inkling2_conv {
     int32_t n_conv;
-    int32_t ncs;
+    int32_t n_cols;
     int32_t n_channels;
     int32_t n_seq_tokens;
     int32_t n_tokens;
     int32_t n_heads;
     int32_t hsz;
     int32_t has_dyn;
+    int32_t hist_off;
     float   scale;
+    int64_t nb1_h;
+    int64_t nb2_h;
+};
+
+// the recurrent state cell: the last n_cols rows of the padded buffer, stored as [lag, channel]
+struct ggml_metal_kargs_inkling2_conv_state {
+    int32_t n_cols;
+    int32_t n_channels;
+    int32_t n_seqs;
+    int32_t n_seq_tokens;
+    int32_t hist_off;
+    int64_t nb1_h;
+    int64_t nb2_h;
+    int64_t nb1_cell;
 };
 
 typedef struct {

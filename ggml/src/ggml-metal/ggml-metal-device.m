@@ -1589,6 +1589,18 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         return true;
     }
 
+    if (op->op == GGML_OP_INKLING2_CONV_STATE) {
+        const struct ggml_tensor * cur  = op->src[0];
+        const struct ggml_tensor * hist = op->src[1];
+        if (cur->type != GGML_TYPE_F32 || hist->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (hist->nb[0] != sizeof(float) || !ggml_is_contiguous(cur)) {
+            return false;
+        }
+        return hist->ne[0] <= 8;
+    }
+
     if (op->op == GGML_OP_INKLING2_CONV) {
         if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
             return false;

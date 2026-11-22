@@ -374,6 +374,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_inkling2_ctrl(ctx, idx);
             } break;
+        case GGML_OP_INKLING2_CONV_STATE:
+            {
+                n_fuse = ggml_metal_op_inkling2_conv_state(ctx, idx);
+            } break;
         case GGML_OP_INKLING2_CONV:
             {
                 n_fuse = ggml_metal_op_inkling2_conv(ctx, idx);
@@ -1169,38 +1173,94 @@ int ggml_metal_op_inkling2_ctrl(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+int ggml_metal_op_inkling2_conv_state(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx); // the state cell view
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * cur  = op->src[0];
+    const ggml_tensor * hist = op->src[1];
+
+    int32_t hist_off = 0;
+    memcpy(&hist_off, op->op_params, sizeof(int32_t));
+
+    const int32_t n_cols       = (int32_t) hist->ne[0];
+    const int32_t n_channels   = (int32_t) cur->ne[0];
+    const int32_t n_seqs       = (int32_t) hist->ne[2];
+    const int32_t n_seq_tokens = (int32_t) (cur->ne[1]/n_seqs);
+
+    ggml_metal_kargs_inkling2_conv_state args = {
+        /*.n_cols       =*/ n_cols,
+        /*.n_channels   =*/ n_channels,
+        /*.n_seqs       =*/ n_seqs,
+        /*.n_seq_tokens =*/ n_seq_tokens,
+        /*.hist_off     =*/ hist_off,
+        /*.nb1_h        =*/ (int64_t) hist->nb[1],
+        /*.nb2_h        =*/ (int64_t) hist->nb[2],
+        /*.nb1_cell     =*/ (int64_t) op->nb[1],
+    };
+
+    char base[256];
+    snprintf(base, 256, "kernel_inkling2_conv_state");
+
+    ggml_metal_pipeline_with_params pipeline = ggml_metal_library_get_pipeline(lib, base);
+    if (!pipeline.pipeline) {
+        pipeline = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+
+    const int nth = 128;
+    const int nt  = n_channels*n_seqs;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cur),  1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(hist), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),   3);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (nt + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
 int ggml_metal_op_inkling2_conv(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
-    const ggml_tensor * x   = op->src[0];
-    const ggml_tensor * w   = op->src[1];
-    const ggml_tensor * cur = op->src[2];
-    const ggml_tensor * dyn = op->src[3];
+    const ggml_tensor * cur  = op->src[0];
+    const ggml_tensor * w    = op->src[1];
+    const ggml_tensor * hist = op->src[2];
+    const ggml_tensor * dyn  = op->src[3];
 
-    const int32_t n_conv       = (int32_t) w->ne[0];
-    const int32_t ncs          = (int32_t) x->ne[0];
-    const int32_t n_channels   = (int32_t) x->ne[1];
-    const int32_t n_seq_tokens = ncs - n_conv + 1;
-    const int32_t n_tokens     = (int32_t) cur->ne[1];
-    const int32_t n_heads      = dyn ? (int32_t) (dyn->ne[0]/n_conv) : 1;
-    const int32_t hsz          = n_channels/n_heads;
+    const int32_t n_conv     = (int32_t) w->ne[0];
+    const int32_t n_cols     = n_conv - 1;
+    const int32_t n_channels = (int32_t) cur->ne[0];
+    const int32_t n_tokens   = (int32_t) cur->ne[1];
+    const int32_t n_seqs     = (int32_t) hist->ne[2];
+    const int32_t n_seq_tok  = n_tokens/n_seqs;
+    const int32_t n_heads    = dyn ? (int32_t) (dyn->ne[0]/n_conv) : 1;
+    const int32_t hsz        = n_channels/n_heads;
 
-    float scale = 1.0f;
-    memcpy(&scale, op->op_params, sizeof(float));
+    float   scale    = 1.0f;
+    int32_t hist_off = 0;
+    memcpy(&scale,    op->op_params,     sizeof(float));
+    memcpy(&hist_off, op->op_params + 4, sizeof(int32_t));
 
     ggml_metal_kargs_inkling2_conv args = {
         /*.n_conv       =*/ n_conv,
-        /*.ncs          =*/ ncs,
+        /*.n_cols       =*/ n_cols,
         /*.n_channels   =*/ n_channels,
-        /*.n_seq_tokens =*/ n_seq_tokens,
+        /*.n_seq_tokens =*/ n_seq_tok,
         /*.n_tokens     =*/ n_tokens,
         /*.n_heads      =*/ n_heads,
         /*.hsz          =*/ hsz,
         /*.has_dyn      =*/ dyn ? 1 : 0,
+        /*.hist_off     =*/ hist_off,
         /*.scale        =*/ scale,
+        /*.nb1_h        =*/ (int64_t) hist->nb[1],
+        /*.nb2_h        =*/ (int64_t) hist->nb[2],
     };
 
     char base[256];
@@ -1216,11 +1276,11 @@ int ggml_metal_op_inkling2_conv(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),   1);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),   2);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cur), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cur),  1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),    2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(hist), 3);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dyn ? dyn : cur), 4);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),  5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),   5);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, (nt + nth - 1)/nth, 1, 1, nth, 1, 1);
 

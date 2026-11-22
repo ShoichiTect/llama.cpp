@@ -1989,57 +1989,87 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                     }
                 }
             } break;
+        case GGML_OP_INKLING2_CONV_STATE:
+            {
+                // the cell holds the last n_cols rows of the padded buffer, as [lag, channel]
+                const struct ggml_tensor * c = tensor->src[0]; // cur
+                const struct ggml_tensor * h = tensor->src[1]; // history
+
+                int32_t hist_off = 0;
+                memcpy(&hist_off, tensor->op_params, sizeof(int32_t));
+
+                const int64_t n_cols       = h->ne[0];
+                const int64_t n_channels   = c->ne[0];
+                const int64_t n_seqs       = h->ne[2];
+                const int64_t n_seq_tokens = c->ne[1]/n_seqs;
+
+                GGML_ASSERT(n_cols <= 8);
+
+                for (int64_t s = 0; s < n_seqs; ++s) {
+                    for (int64_t ch = 0; ch < n_channels; ++ch) {
+                        float v[8];
+                        for (int64_t l = 0; l < n_cols; ++l) {
+                            const int64_t k = n_seq_tokens + l;
+                            v[l] = k < n_cols
+                                ? *(const float *) ((const char *) h->data + k*sizeof(float) + (hist_off + ch)*h->nb[1] + s*h->nb[2])
+                                : *(const float *) ((const char *) c->data + (ch + n_channels*(s*n_seq_tokens + (k - n_cols)))*sizeof(float));
+                        }
+                        float * cell = (float *) ((char *) tensor->data + s*tensor->nb[1] + ch*n_cols*sizeof(float));
+                        for (int64_t l = 0; l < n_cols; ++l) {
+                            cell[l] = v[l];
+                        }
+                    }
+                }
+            } break;
         case GGML_OP_INKLING2_CONV:
             {
-                const struct ggml_tensor * src0 = tensor->src[0]; // x     [ncs, n_channels, n_seqs]
-                const struct ggml_tensor * src1 = tensor->src[1]; // w     [n_conv, n_channels]
-                const struct ggml_tensor * src2 = tensor->src[2]; // cur   [n_channels, n_tokens]
-                const struct ggml_tensor * src3 = tensor->src[3]; // dyn   [n_conv*n_heads, n_tokens] (may be NULL)
+                const struct ggml_tensor * cur  = tensor->src[0]; // [n_channels, n_tokens]
+                const struct ggml_tensor * w    = tensor->src[1]; // [n_conv, n_channels]
+                const struct ggml_tensor * hist = tensor->src[2]; // [n_cols, n_sconv_channels, n_seqs]
+                const struct ggml_tensor * dyn  = tensor->src[3];
 
-                const int n_conv       = (int) src1->ne[0];
-                const int ncs          = (int) src0->ne[0];
-                const int n_channels   = (int) src0->ne[1];
-                const int n_seq_tokens = ncs - n_conv + 1;
-                const int n_tokens     = (int) src2->ne[1];
-                const int n_heads      = src3 ? (int) (src3->ne[0]/n_conv) : 1;
-                const int hsz          = n_channels/n_heads;
+                const int64_t n_conv     = w->ne[0];
+                const int64_t n_cols     = n_conv - 1;
+                const int64_t n_channels = cur->ne[0];
+                const int64_t n_tokens   = cur->ne[1];
+                const int64_t n_seqs     = hist->ne[2];
+                const int64_t n_seq_tok  = n_tokens/n_seqs;
+                const int64_t n_heads    = dyn ? dyn->ne[0]/n_conv : 1;
+                const int64_t hsz        = n_channels/n_heads;
 
-                float scale = 1.0f;
-                memcpy(&scale, tensor->op_params, sizeof(float));
-
-                const float * x   = (const float *) src0->data;
-                const float * w   = (const float *) src1->data;
-                const float * cur = (const float *) src2->data;
-                const float * dyn = src3 ? (const float *) src3->data : NULL;
-                float       * out = (float *) tensor->data;
+                float   scale    = 1.0f;
+                int32_t hist_off = 0;
+                memcpy(&scale,    tensor->op_params,     sizeof(float));
+                memcpy(&hist_off, tensor->op_params + 4, sizeof(int32_t));
 
                 for (int64_t t = 0; t < n_tokens; ++t) {
-                    const int s    = (int) (t/n_seq_tokens);
-                    const int tpos = (int) (t%n_seq_tokens);
+                    const int64_t s    = t/n_seq_tok;
+                    const int64_t tpos = t%n_seq_tok;
 
                     for (int64_t ch = 0; ch < n_channels; ++ch) {
                         float acc = 0.0f;
 
-                        for (int lag = 0; lag < n_conv; ++lag) {
-                            const int k = tpos + lag;
-                            const float v = k < n_conv - 1
-                                ? x[k + ncs*(ch + n_channels*s)]
-                                : cur[ch + n_channels*(s*n_seq_tokens + (k - (n_conv - 1)))];
-                            acc += v*w[ch*n_conv + lag];
+                        for (int64_t lag = 0; lag < n_conv; ++lag) {
+                            const int64_t k = tpos + lag;
+                            const float v = k < n_cols
+                                ? *(const float *) ((const char *) hist->data + k*sizeof(float) + (hist_off + ch)*hist->nb[1] + s*hist->nb[2])
+                                : *(const float *) ((const char *) cur->data + (ch + n_channels*(s*n_seq_tok + (k - n_cols)))*sizeof(float));
+                            acc += v*((const float *) w->data)[ch*n_conv + lag];
                         }
 
                         if (dyn) {
-                            const int head = (int) ch/hsz;
-                            for (int lag = 0; lag < n_conv; ++lag) {
-                                const int k = tpos + (n_conv - 1 - lag);
-                                const float v = k < n_conv - 1
-                                    ? x[k + ncs*(ch + n_channels*s)]
-                                    : cur[ch + n_channels*(s*n_seq_tokens + (k - (n_conv - 1)))];
-                                acc += v*dyn[lag + n_conv*(head + n_heads*t)];
+                            const int64_t head = ch/hsz;
+                            for (int64_t lag = 0; lag < n_conv; ++lag) {
+                                const int64_t k = tpos + (n_cols - lag);
+                                const float v = k < n_cols
+                                    ? *(const float *) ((const char *) hist->data + k*sizeof(float) + (hist_off + ch)*hist->nb[1] + s*hist->nb[2])
+                                    : *(const float *) ((const char *) cur->data + (ch + n_channels*(s*n_seq_tok + (k - n_cols)))*sizeof(float));
+                                acc += v*((const float *) dyn->data)[lag + n_conv*(head + n_heads*t)];
                             }
                         }
 
-                        out[ch + n_channels*t] = (cur[ch + n_channels*t] + acc)*scale;
+                        ((float *) tensor->data)[ch + n_channels*t] =
+                            (((const float *) cur->data)[ch + n_channels*t] + acc)*scale;
                     }
                 }
             } break;
@@ -2627,6 +2657,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_INKLING2_CLIP:
         case GGML_OP_INKLING2_CONV:
+        case GGML_OP_INKLING2_CONV_STATE:
         case GGML_OP_INKLING2_CTRL:
         case GGML_OP_INKLING2_GATE:
         case GGML_OP_INKLING2_SITU:
