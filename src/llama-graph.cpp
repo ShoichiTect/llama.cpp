@@ -2678,12 +2678,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float beta = hparams.situ_beta;
                     const float lb   = hparams.situ_linear_beta;
 
-                    ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
-                    act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
-                    if (lb > 0.0f) {
-                        up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
-                    }
-                    cur = ggml_mul(ctx0, act, up);
+                    // one node for the 9-node chain (scale/tanh/scale/mul/sigmoid/scale/tanh/scale/mul)
+                    ggml_tensor * act = ggml_new_tensor(ctx0, GGML_TYPE_F32, ggml_n_dims(cur), cur->ne);
+                    act->op     = GGML_OP_INKLING2_SITU;
+                    act->src[0] = cur;
+                    act->src[1] = up;
+                    memcpy(act->op_params,     &beta, sizeof(float));
+                    memcpy(act->op_params + 4, &lb,   sizeof(float));
+                    cur = act;
                     cb(cur, "ffn_moe_situ", il);
                 } break;
             case LLM_FFN_GELU:

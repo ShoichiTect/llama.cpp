@@ -231,6 +231,16 @@ struct ggml_metal_kargs_inkling2_clip {
     float   threshold;
 };
 
+// inkling2: situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
+struct ggml_metal_kargs_inkling2_situ {
+    int32_t ne0;
+    int32_t nrows;
+    int64_t nb1_g;
+    int64_t nb1_u;
+    float   beta;
+    float   lb;
+};
+
 // inkling2: rms_norm(cur) and rms_norm(message) concatenated along ne0
 struct ggml_metal_kargs_inkling2_gate {
     int32_t ne0;

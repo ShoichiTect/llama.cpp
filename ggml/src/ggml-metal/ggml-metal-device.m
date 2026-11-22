@@ -1551,6 +1551,19 @@ static bool ggml_metal_supports_mul_mat_op(
 }
 
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
+    if (op->op == GGML_OP_INKLING2_SITU) {
+        if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+            return false;
+        }
+        for (int i = 0; i < 2; ++i) {
+            const struct ggml_tensor * s = op->src[i];
+            if (s->type != GGML_TYPE_F32 || s->nb[0] != sizeof(float) || s->nb[2] != s->nb[1]*s->ne[1]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     if (op->op == GGML_OP_INKLING2_GATE) {
         if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) || op->ne[0] % 8 != 0) {
             return false;

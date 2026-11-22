@@ -114,6 +114,7 @@ int  ggml_metal_op_inkling2_clip    (ggml_metal_op_t ctx, int idx);
 int  ggml_metal_op_inkling2_conv    (ggml_metal_op_t ctx, int idx);
 int  ggml_metal_op_inkling2_ctrl    (ggml_metal_op_t ctx, int idx);
 int  ggml_metal_op_inkling2_gate    (ggml_metal_op_t ctx, int idx);
+int  ggml_metal_op_inkling2_situ    (ggml_metal_op_t ctx, int idx);
 
 void ggml_metal_ops_profile_dump(void);
 

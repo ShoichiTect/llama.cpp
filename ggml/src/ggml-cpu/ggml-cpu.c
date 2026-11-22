@@ -1892,6 +1892,44 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                     }
                 }
             } break;
+        case GGML_OP_INKLING2_SITU:
+            {
+                // situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
+                const struct ggml_tensor * g = tensor->src[0];
+                const struct ggml_tensor * u = tensor->src[1];
+
+                float beta = 1.0f;
+                float lb   = 1.0f;
+                memcpy(&beta, tensor->op_params,     sizeof(float));
+                memcpy(&lb,   tensor->op_params + 4, sizeof(float));
+
+                const int64_t ne0   = tensor->ne[0];
+                const int64_t nrows = ggml_nrows(tensor);
+
+                const char * gd = (const char *) g->data;
+                const char * ud = (const char *) u->data;
+                float      * od = (float *) tensor->data;
+
+                for (int64_t ir = 0; ir < nrows; ++ir) {
+                    const int64_t i1 = ir % g->ne[1];
+                    const int64_t i2 = ir / g->ne[1];
+
+                    const float * gp = (const float *) (gd + i1*g->nb[1] + i2*g->nb[2]);
+                    const float * up_ = (const float *) (ud + i1*u->nb[1] + i2*u->nb[2]);
+                    float       * op_ = (float *) (od + ir*ne0*sizeof(float));
+
+                    for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                        const float gv = gp[i0];
+                        float act = beta*tanhf(gv*(1.0f/beta)) * (1.0f/(1.0f + expf(-gv)));
+                        if (lb > 0.0f) {
+                            act *= lb*tanhf(up_[i0]*(1.0f/lb));
+                        } else {
+                            act *= up_[i0];
+                        }
+                        op_[i0] = act;
+                    }
+                }
+            } break;
         case GGML_OP_INKLING2_GATE:
             {
                 const struct ggml_tensor * c = tensor->src[0]; // cur     [ne0, nrows]
@@ -2591,6 +2629,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_INKLING2_CONV:
         case GGML_OP_INKLING2_CTRL:
         case GGML_OP_INKLING2_GATE:
+        case GGML_OP_INKLING2_SITU:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:

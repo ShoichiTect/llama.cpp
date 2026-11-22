@@ -160,3 +160,34 @@ kernel void kernel_inkling2_gate(
         }
     }
 }
+
+// situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
+// the same expression order as the 9-node chain, so the result is bit-identical
+kernel void kernel_inkling2_situ(
+        constant ggml_metal_kargs_inkling2_situ & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const int64_t i0  = (int64_t) gid % args.ne0;
+    const int64_t row = (int64_t) gid / args.ne0;
+    if (row >= args.nrows) {
+        return;
+    }
+
+    const device float * g = (device const float *) (src0 + row*args.nb1_g + i0*4);
+    const device float * u = (device const float *) (src1 + row*args.nb1_u + i0*4);
+    device       float * o = (device       float *) (dst  + (row*args.ne0 + i0)*4);
+
+    const float gv = g[0];
+
+    float act = args.beta*tanh(gv*(1.0f/args.beta)) * (1.0f/(1.0f + exp(-gv)));
+
+    if (args.lb > 0.0f) {
+        act *= args.lb*tanh(u[0]*(1.0f/args.lb));
+    } else {
+        act *= u[0];
+    }
+
+    o[0] = act;
+}
