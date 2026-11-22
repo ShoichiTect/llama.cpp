@@ -246,28 +246,17 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
     build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
 
-    ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
-    out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+    // one node for the taps, the dynamic taps, the residual and the scale
+    ggml_tensor * out = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_channels, n_tokens);
+    out->op     = GGML_OP_INKLING2_CONV;
+    out->src[0] = x;
+    out->src[1] = weight;
+    out->src[2] = cur;
+    out->src[3] = dynamic;
 
-    if (dynamic) {
-        const int64_t n_heads = dynamic->ne[0]/n_conv;
-
-        dynamic = ggml_reshape_3d(ctx0, dynamic, n_conv, n_heads, n_tokens);
-
-        for (int64_t lag = 0; lag < n_conv; ++lag) {
-            ggml_tensor * tap    = ggml_view_3d(ctx0, dynamic, 1, n_heads, n_tokens, dynamic->nb[1], dynamic->nb[2], lag*dynamic->nb[0]);
-            ggml_tensor * window = ggml_view_3d(ctx0, x, n_seq_tokens, n_channels, n_seqs, x->nb[1], x->nb[2], (n_conv - 1 - lag)*x->nb[0]);
-
-            window = ggml_cont(ctx0, ggml_transpose(ctx0, window));
-            window = ggml_reshape_3d(ctx0, window, n_channels/n_heads, n_heads, n_tokens);
-
-            ggml_tensor * term = ggml_reshape_2d(ctx0, ggml_mul(ctx0, window, tap), n_channels, n_tokens);
-
-            out = ggml_add(ctx0, out, term);
-        }
-    }
-
-    out = ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+    const float conv_scale = 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1);
+    memcpy(out->op_params, &conv_scale, sizeof(conv_scale));
+    ggml_set_name(out, "inkling2_conv");
 
     // right after the state store, so that the convolution is one run of nodes that backends can fuse
     ggml_build_forward_expand(gf, out);

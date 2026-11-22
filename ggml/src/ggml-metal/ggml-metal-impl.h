@@ -231,6 +231,19 @@ struct ggml_metal_kargs_inkling2_clip {
     float   threshold;
 };
 
+// inkling2: the whole short-conv chain (taps + optional dynamic taps + residual + scale)
+struct ggml_metal_kargs_inkling2_conv {
+    int32_t n_conv;
+    int32_t ncs;
+    int32_t n_channels;
+    int32_t n_seq_tokens;
+    int32_t n_tokens;
+    int32_t n_heads;
+    int32_t hsz;
+    int32_t has_dyn;
+    float   scale;
+};
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;

@@ -362,6 +362,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_glu(ctx, idx);
             } break;
+        case GGML_OP_INKLING2_CONV:
+            {
+                n_fuse = ggml_metal_op_inkling2_conv(ctx, idx);
+            } break;
         case GGML_OP_INKLING2_CLIP:
             {
                 n_fuse = ggml_metal_op_inkling2_clip(ctx, idx);
@@ -1017,6 +1021,64 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, nk, nrows, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_inkling2_conv(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * x   = op->src[0];
+    const ggml_tensor * w   = op->src[1];
+    const ggml_tensor * cur = op->src[2];
+    const ggml_tensor * dyn = op->src[3];
+
+    const int32_t n_conv       = (int32_t) w->ne[0];
+    const int32_t ncs          = (int32_t) x->ne[0];
+    const int32_t n_channels   = (int32_t) x->ne[1];
+    const int32_t n_seq_tokens = ncs - n_conv + 1;
+    const int32_t n_tokens     = (int32_t) cur->ne[1];
+    const int32_t n_heads      = dyn ? (int32_t) (dyn->ne[0]/n_conv) : 1;
+    const int32_t hsz          = n_channels/n_heads;
+
+    float scale = 1.0f;
+    memcpy(&scale, op->op_params, sizeof(float));
+
+    ggml_metal_kargs_inkling2_conv args = {
+        /*.n_conv       =*/ n_conv,
+        /*.ncs          =*/ ncs,
+        /*.n_channels   =*/ n_channels,
+        /*.n_seq_tokens =*/ n_seq_tokens,
+        /*.n_tokens     =*/ n_tokens,
+        /*.n_heads      =*/ n_heads,
+        /*.hsz          =*/ hsz,
+        /*.has_dyn      =*/ dyn ? 1 : 0,
+        /*.scale        =*/ scale,
+    };
+
+    char base[256];
+    snprintf(base, 256, "kernel_inkling2_conv");
+
+    ggml_metal_pipeline_with_params pipeline = ggml_metal_library_get_pipeline(lib, base);
+    if (!pipeline.pipeline) {
+        pipeline = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+
+    const int nth = 256;
+    const int nt  = n_channels*n_tokens;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cur), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dyn ? dyn : cur), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),  5);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (nt + nth - 1)/nth, 1, 1, nth, 1, 1);
 
     return 1;
 }

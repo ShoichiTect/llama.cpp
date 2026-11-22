@@ -434,6 +434,7 @@ extern "C" {
         GGML_OP_SLEEP,
 
         GGML_OP_INKLING2_CLIP,
+    GGML_OP_INKLING2_CONV,
 
         GGML_OP_COUNT,
     };
