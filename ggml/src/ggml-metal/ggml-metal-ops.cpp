@@ -1,5 +1,9 @@
 #include "ggml-metal-ops.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <atomic>
+
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -184,8 +188,38 @@ static bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml_tensor
     return ggml_mem_ranges_add(ctx->mem_ranges, node);
 }
 
+// --- ディスパッチ数のプロファイラ(GGML_METAL_PROFILE=1 で有効)---
+static std::atomic<uint64_t> g_prof_counts[GGML_OP_COUNT];
+static std::atomic<uint64_t> g_prof_total{0};
+static std::atomic<uint64_t> g_prof_fused{0};
+
+extern "C" void ggml_metal_ops_profile_dump(void) {
+    const uint64_t total = g_prof_total.load();
+    fprintf(stderr, "[metal-prof] dispatches=%llu (fused nodes skipped=%llu)\n",
+            (unsigned long long) total, (unsigned long long) g_prof_fused.load());
+    // 多い順に上位 15 を出す
+    for (int k = 0; k < 15; ++k) {
+        int best = -1; uint64_t bestv = 0;
+        for (int op = 0; op < GGML_OP_COUNT; ++op) {
+            const uint64_t v = g_prof_counts[op].load();
+            if (v > bestv) { bestv = v; best = op; }
+        }
+        if (best < 0) break;
+        fprintf(stderr, "[metal-prof]   %-18s %6llu\n", ggml_op_name((enum ggml_op) best), (unsigned long long) bestv);
+        g_prof_counts[best].store(0);
+        if (bestv == 0) break;
+    }
+    g_prof_total.store(0);
+    g_prof_fused.store(0);
+}
+
 static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     struct ggml_tensor * node = ctx->node(idx);
+
+    if (getenv("GGML_METAL_PROFILE")) {
+        g_prof_counts[node->op].fetch_add(1);
+        g_prof_total.fetch_add(1);
+    }
 
     //GGML_LOG_INFO("%s: encoding node %3d, op = %8s\n", __func__, idx, ggml_op_name(node->op));
 
@@ -327,6 +361,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_GLU:
             {
                 n_fuse = ggml_metal_op_glu(ctx, idx);
+            } break;
+        case GGML_OP_INKLING2_CLIP:
+            {
+                n_fuse = ggml_metal_op_inkling2_clip(ctx, idx);
             } break;
         case GGML_OP_SUM:
             {
@@ -979,6 +1017,42 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, nk, nrows, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_inkling2_clip(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    float threshold = 0.0f;
+    memcpy(&threshold, op->op_params, sizeof(float));
+
+    ggml_metal_kargs_inkling2_clip args = {
+        /*.ne0       =*/ (int32_t) op->ne[0],
+        /*.nrows     =*/ (int32_t) ggml_nrows(op),
+        /*.threshold =*/ threshold,
+    };
+
+    char base[256];
+    snprintf(base, 256, "kernel_inkling2_clip");
+
+    ggml_metal_pipeline_with_params pipeline = ggml_metal_library_get_pipeline(lib, base);
+    if (!pipeline.pipeline) {
+        pipeline = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+
+    const int nth = 64;
+    const int nt  = args.nrows;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (nt + nth - 1)/nth, 1, 1, nth, 1, 1);
 
     return 1;
 }

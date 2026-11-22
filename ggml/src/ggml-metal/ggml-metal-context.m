@@ -678,6 +678,10 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
     }
 
+    if (getenv("GGML_METAL_PROFILE")) {
+        ggml_metal_ops_profile_dump();
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 

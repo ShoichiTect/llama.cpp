@@ -224,6 +224,13 @@ typedef struct {
     int32_t  nc0;
 } ggml_metal_kargs_concat;
 
+// inkling2 fused L2 clip on the head dimension
+struct ggml_metal_kargs_inkling2_clip {
+    int32_t ne0;
+    int32_t nrows;
+    float   threshold;
+};
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;

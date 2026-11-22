@@ -166,12 +166,17 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
         cur = ggml_mul(ctx0, cur, scale);
     }
 
-    ggml_tensor * norm = ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, cur)));
-    norm = ggml_scale_bias(ctx0, norm, 1.0f, 1e-6f);
+    // one op for the whole chain: sqr/sum_rows/sqrt/scale_bias/fill/div/clamp/mul is 8 dispatches,
+    // and the chain runs 3 times per visit (Q, K, R) over 48 visits
+    ggml_tensor * out = ggml_new_tensor(ctx0, GGML_TYPE_F32, ggml_n_dims(cur), cur->ne);
+    out->op = GGML_OP_INKLING2_CLIP;
+    out->src[0] = cur;
 
-    ggml_tensor * factor = ggml_div(ctx0, ggml_fill(ctx0, norm, threshold), norm);
+    const float t = threshold;
+    memcpy(out->op_params, &t, sizeof(t));
+    ggml_set_name(out, "inkling2_clip");
 
-    return ggml_mul(ctx0, cur, ggml_clamp(ctx0, factor, 0.0f, 1.0f));
+    return out;
 }
 
 // the norm is per state, so the normalized blocks are built once and extended by one block at a time

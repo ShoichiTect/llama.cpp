@@ -1858,6 +1858,40 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_silu_back(params, tensor);
             } break;
+        case GGML_OP_INKLING2_CLIP:
+            {
+                // out = x * min(threshold / (sqrt(sum(x^2, dim0)) + 1e-6), 1)
+                const struct ggml_tensor * src0 = tensor->src[0];
+                float threshold;
+                memcpy(&threshold, tensor->op_params, sizeof(float));
+
+                const int64_t ne0 = src0->ne[0];
+                const int64_t ne1 = src0->ne[1];
+                const int64_t ne2 = src0->ne[2];
+                const int64_t ne3 = src0->ne[3];
+                const int64_t nr  = ne1*ne2*ne3;
+
+                for (int64_t r = params->ith; r < nr; r += params->nth) {
+                    const int64_t i1 =  r % ne1;
+                    const int64_t i2 = (r/ne1) % ne2;
+                    const int64_t i3 = (r/ne1/ne2) % ne3;
+
+                    const char * px = (const char *) src0->data + i1*src0->nb[1] + i2*src0->nb[2] + i3*src0->nb[3];
+                    char * py = (char *) tensor->data + i1*tensor->nb[1] + i2*tensor->nb[2] + i3*tensor->nb[3];
+
+                    float sum = 0.0f;
+                    for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                        const float v = *(const float *)(px + i0*src0->nb[0]);
+                        sum += v*v;
+                    }
+                    float f = threshold/(sqrtf(sum) + 1e-6f);
+                    f = f > 1.0f ? 1.0f : f;
+                    f = f < 0.0f ? 0.0f : f;
+                    for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                        *(float *)(py + i0*tensor->nb[0]) = *(const float *)(px + i0*src0->nb[0])*f;
+                    }
+                }
+            } break;
         case GGML_OP_NORM:
             {
                 ggml_compute_forward_norm(params, tensor);

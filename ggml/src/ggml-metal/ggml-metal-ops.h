@@ -110,6 +110,10 @@ int ggml_metal_op_opt_step_adamw    (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_opt_step_sgd      (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_count_equal       (ggml_metal_op_t ctx, int idx);
 
+int  ggml_metal_op_inkling2_clip    (ggml_metal_op_t ctx, int idx);
+
+void ggml_metal_ops_profile_dump(void);
+
 #ifdef __cplusplus
 }
 #endif
