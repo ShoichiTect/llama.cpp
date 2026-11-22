@@ -381,16 +381,15 @@ kernel void kernel_inkling2_mask(
         device const char * pos,
         device const char * mask,
         device       char * dst,
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        uint3 tiitg [[thread_position_in_threadgroup]]) {
-    const int64_t h = (int64_t) tgpig.z;
-    const int64_t t = (int64_t) tgpig.y % args.n_tps;
-    const int64_t s = (int64_t) tgpig.y / args.n_tps;
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        uint3  tiitg [[thread_position_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const int64_t h  = (int64_t) tgpig.z;
+    const int64_t t  = (int64_t) tgpig.y % args.n_tps;
+    const int64_t s  = (int64_t) tgpig.y / args.n_tps;
 
     const int64_t kv = (int64_t) tgpig.x*args.nth_kv + (int64_t) tiitg.x;
-    if (kv >= args.n_kv || h >= args.n_head) {
-        return;
-    }
+    const bool    on = kv < args.n_kv;
 
     const int64_t tok = t + args.n_tps*s;
 
@@ -398,14 +397,63 @@ kernel void kernel_inkling2_mask(
     const device char * pr = r + h*args.nb1_r + tok*args.nb2_r;
     const float          sv = *(device const float *) (sink + h*args.nb1_sink + tok*args.nb2_sink);
 
-    const int32_t b = *(device const int *) (pos + kv*args.nb1_pos + (t + args.n_tps*s)*args.nb2_pos);
+    // the lanes past n_kv keep a sentinel bucket, so that the simdgroup code below runs in uniform
+    // control flow (simd_min / simd_shuffle are undefined if part of the simdgroup is inactive)
+    const int32_t b = on
+        ? *(device const int *) (pos + kv*args.nb1_pos + tok*args.nb2_pos)
+        : args.n_ext;
+
+    // the 16 bias values of bucket b are one 64B row, and consecutive kv ask for consecutive buckets.
+    // gathering them per lane issues one 64B transaction per lane per element (32 lanes -> 2 KB of
+    // sectors for 128 B of data), which alone made this the second slowest op of prefill.
+    // instead the simdgroup loads the window of buckets cooperatively (one row per lane, the rows are
+    // adjacent so the loads coalesce) and each lane shuffles out the row it needs.
+    float4 bs[4] = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
 
     float sum = 0.0f;
-    if (b < args.n_ext) {
+
+    if (args.n_rel == 16) {
+        const int32_t lo  = simd_min(b);
+        const int32_t id  = b - lo;
+        const int32_t own = lo + (int32_t) tiisg;
+
+        // warp-uniform: when the buckets of this simdgroup do not fit in one window, gather directly
+        if (simd_max(id) >= 32) {
+            if (b < args.n_ext) {
+                const device char * pb = bias + (int64_t) b*args.nb1_b;
+                for (int i = 0; i < args.n_rel; ++i) {
+                    sum += (*(device const float *) (pb + i*4)) * (*(device const float *) (pr + i*4));
+                }
+            }
+        } else {
+
+        if (own >= 0 && own < args.n_ext) {
+            const device char * pb = bias + (int64_t) own*args.nb1_b;
+            bs[0] = *(device const float4 *) (pb +  0);
+            bs[1] = *(device const float4 *) (pb + 16);
+            bs[2] = *(device const float4 *) (pb + 32);
+            bs[3] = *(device const float4 *) (pb + 48);
+        }
+
+            for (int k = 0; k < 4; ++k) {
+                const float4 bv = float4(
+                        simd_shuffle(bs[k].x, ushort(id)), simd_shuffle(bs[k].y, ushort(id)),
+                        simd_shuffle(bs[k].z, ushort(id)), simd_shuffle(bs[k].w, ushort(id)));
+                const float4 rv = *(device const float4 *) (pr + (k*4)*4);
+                sum += (bv.x*rv.x + bv.y*rv.y + bv.z*rv.z + bv.w*rv.w);
+            }
+
+            sum = b < args.n_ext ? sum : 0.0f;
+        }
+    } else if (b < args.n_ext) {
         const device char * pb = bias + (int64_t) b*args.nb1_b;
         for (int i = 0; i < args.n_rel; ++i) {
             sum += (*(device const float *) (pb + i*4)) * (*(device const float *) (pr + i*4));
         }
+    }
+
+    if (!on) {
+        return;
     }
 
     const device char * pm = mask + kv*args.nb1_m + t*args.nb2_m + s*args.nb3_m;
