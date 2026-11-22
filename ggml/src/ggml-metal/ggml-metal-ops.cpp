@@ -362,6 +362,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_glu(ctx, idx);
             } break;
+        case GGML_OP_INKLING2_GATE:
+            {
+                n_fuse = ggml_metal_op_inkling2_gate(ctx, idx);
+            } break;
         case GGML_OP_INKLING2_CTRL:
             {
                 n_fuse = ggml_metal_op_inkling2_ctrl(ctx, idx);
@@ -1025,6 +1029,57 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, nk, nrows, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_inkling2_gate(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    float eps = 0.0f;
+    memcpy(&eps, op->op_params, sizeof(float));
+
+    const int32_t ne0   = (int32_t) op->ne[0]/2;
+    const int32_t ne0_t = ne0 % 4 == 0 ? ne0/4 : ne0;
+    const int32_t nrows = (int32_t) op->ne[1];
+
+    ggml_metal_kargs_inkling2_gate args = {
+        /*.ne0    =*/ ne0,
+        /*.ne0_t  =*/ ne0_t,
+        /*.nrows  =*/ nrows,
+        /*.nb1_c  =*/ (int64_t) op->src[0]->nb[1],
+        /*.nb1_m  =*/ (int64_t) op->src[1]->nb[1],
+        /*.nb1_d  =*/ (int64_t) op->nb[1],
+        /*.eps    =*/ eps,
+    };
+
+    char base[256];
+    snprintf(base, 256, "kernel_inkling2_gate");
+
+    ggml_metal_pipeline_with_params pipeline = ggml_metal_library_get_pipeline(lib, base);
+    if (!pipeline.pipeline) {
+        pipeline = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+
+    // exactly the thread count that ggml_metal_op_norm picks, so that the reduction tree matches
+    int nth = 32;
+    while (nth < ne0_t && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+        nth *= 2;
+    }
+    nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    nth = std::min(nth, (ne0_t + 31)/32*32);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*sizeof(float), 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, nth, 1, 1);
 
     return 1;
 }

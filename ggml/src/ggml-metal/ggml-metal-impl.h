@@ -231,6 +231,17 @@ struct ggml_metal_kargs_inkling2_clip {
     float   threshold;
 };
 
+// inkling2: rms_norm(cur) and rms_norm(message) concatenated along ne0
+struct ggml_metal_kargs_inkling2_gate {
+    int32_t ne0;
+    int32_t ne0_t;
+    int32_t nrows;
+    int64_t nb1_c;
+    int64_t nb1_m;
+    int64_t nb1_d;
+    float   eps;
+};
+
 // inkling2: the controller tail: out = (cur - tanh(forget)*cur) + tanh(gain)*message
 struct ggml_metal_kargs_inkling2_ctrl {
     int32_t ne0;

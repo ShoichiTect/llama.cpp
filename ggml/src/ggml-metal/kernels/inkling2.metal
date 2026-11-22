@@ -106,3 +106,57 @@ kernel void kernel_inkling2_ctrl(
 
     out[gid] = (c - p) + q;
 }
+
+// rms_norm(cur) || rms_norm(message): the reduction is the same one as kernel_rms_norm_f32
+// (float4 chunks, per-simdgroup simd_sum, then across the simdgroups), so the result is bit-identical
+kernel void kernel_inkling2_gate(
+        constant ggml_metal_kargs_inkling2_gate & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int64_t row = tgpig.x;
+
+    device const float4 * xc = (device const float4 *) (src0 + row*args.nb1_c);
+    device const float4 * xm = (device const float4 *) (src1 + row*args.nb1_m);
+    device       float4 * y  = (device       float4 *) (dst  + row*args.nb1_d);
+
+    for (int part = 0; part < 2; ++part) {
+        device const float4 * x = part ? xm : xc;
+        device       float4 * o = part ? y + args.ne0_t : y;
+
+        if (sgitg == 0) {
+            shmem_f32[tiisg] = 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float sumf = 0.0f;
+        for (int i = tpitg.x; i < args.ne0_t; i += ntg.x) {
+            sumf += dot(x[i], x[i]);
+        }
+        sumf = simd_sum(sumf);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tiisg == 0) {
+            shmem_f32[sgitg] = sumf;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        sumf = shmem_f32[tiisg];
+        sumf = simd_sum(sumf);
+
+        const float scale = 1.0f/sqrt(sumf/args.ne0 + args.eps);
+
+        for (int i = tpitg.x; i < args.ne0_t; i += ntg.x) {
+            o[i] = x[i]*scale;
+        }
+    }
+}

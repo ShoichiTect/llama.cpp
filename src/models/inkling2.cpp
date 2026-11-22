@@ -266,7 +266,16 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
-    ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
+    // one node for rms_norm(cur) || rms_norm(message)
+    ggml_tensor * gate = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 2*cur->ne[0], cur->ne[1]);
+    gate->op     = GGML_OP_INKLING2_GATE;
+    gate->src[0] = cur;
+    gate->src[1] = message;
+
+    const float gate_eps = 1e-6f;
+    memcpy(gate->op_params, &gate_eps, sizeof(gate_eps));
+    ggml_set_name(gate, "inkling2_gate");
+
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
     // both projections first, so that the elementwise tail is one run of nodes that backends can fuse

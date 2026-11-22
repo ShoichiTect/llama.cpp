@@ -1551,6 +1551,18 @@ static bool ggml_metal_supports_mul_mat_op(
 }
 
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
+    if (op->op == GGML_OP_INKLING2_GATE) {
+        if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) || op->ne[0] % 8 != 0) {
+            return false;
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (op->src[i]->type != GGML_TYPE_F32 || op->src[i]->nb[0] != sizeof(float)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     if (op->op == GGML_OP_INKLING2_CTRL) {
         // the inputs are strided views of [n_embd, n_query, n_tokens], so only the rows must be packed
         if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {

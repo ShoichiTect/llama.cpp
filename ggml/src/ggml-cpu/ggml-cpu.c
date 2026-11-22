@@ -1892,6 +1892,39 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                     }
                 }
             } break;
+        case GGML_OP_INKLING2_GATE:
+            {
+                const struct ggml_tensor * c = tensor->src[0]; // cur     [ne0, nrows]
+                const struct ggml_tensor * m = tensor->src[1]; // message [ne0, nrows]
+
+                const int64_t ne0  = tensor->ne[0]/2;
+                const int64_t nrows = tensor->ne[1];
+
+                float eps = 0.0f;
+                memcpy(&eps, tensor->op_params, sizeof(float));
+
+                const char  * cd = (const char *) c->data;
+                const char  * md = (const char *) m->data;
+                float * od = (float *) tensor->data;
+
+                for (int64_t i1 = 0; i1 < nrows; ++i1) {
+                    for (int half = 0; half < 2; ++half) {
+                        const struct ggml_tensor * s = half ? m : c;
+                        const char * sd = half ? md : cd;
+
+                        float sum = 0.0f;
+                        for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                            const float v = *(const float *) (sd + i0*sizeof(float) + i1*s->nb[1]);
+                            sum += v*v;
+                        }
+                        const float scale = 1.0f/sqrtf(sum/ne0 + eps);
+                        for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                            const float v = *(const float *) (sd + i0*sizeof(float) + i1*s->nb[1]);
+                            od[half*ne0 + i0 + 2*ne0*i1] = v*scale;
+                        }
+                    }
+                }
+            } break;
         case GGML_OP_INKLING2_CTRL:
             {
                 const struct ggml_tensor * g = tensor->src[0]; // cur    [n_embd, n_tokens]
@@ -2557,6 +2590,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_INKLING2_CLIP:
         case GGML_OP_INKLING2_CONV:
         case GGML_OP_INKLING2_CTRL:
+        case GGML_OP_INKLING2_GATE:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
