@@ -114,10 +114,13 @@ int  ggml_metal_op_inkling2_clip    (ggml_metal_op_t ctx, int idx);
 int  ggml_metal_op_inkling2_conv    (ggml_metal_op_t ctx, int idx);
 int  ggml_metal_op_inkling2_conv_state(ggml_metal_op_t ctx, int idx);
 int  ggml_metal_op_inkling2_ctrl    (ggml_metal_op_t ctx, int idx);
+int  ggml_metal_op_inkling2_relbias (ggml_metal_op_t ctx, int idx);
 int  ggml_metal_op_inkling2_gate    (ggml_metal_op_t ctx, int idx);
 int  ggml_metal_op_inkling2_situ    (ggml_metal_op_t ctx, int idx);
 
 void ggml_metal_ops_profile_dump(void);
+void ggml_metal_ops_profile_time_add(enum ggml_op op, uint64_t ns);
+void ggml_metal_ops_profile_time_dump(void);
 
 #ifdef __cplusplus
 }

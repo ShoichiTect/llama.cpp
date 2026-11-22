@@ -442,17 +442,19 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         // project r on the bias table, the attention gathers it by distance: [n_head, extent + 1, n_tokens]
         // the last bucket is a zero pad, for the cells that are farther than the extent
-        ggml_tensor * table = inkling2_ablate("norel")
-            ? nullptr
-            : ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
-
-        if (table) {
-
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
-        table = ggml_sub(ctx0, table, sinks);
-        table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+        // one node for the whole table: mul_mat(k = n_rel) + sub + cont(permute) were 5 dispatches and ~30% of prefill
+        ggml_tensor * table = nullptr;
+        if (!inkling2_ablate("norel")) {
+            table = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_head, layer.attn_rel_bias->ne[1] + 1, n_tokens);
+            table->op     = GGML_OP_INKLING2_RELBIAS;
+            table->src[0] = layer.attn_rel_bias; // [n_rel, n_extent], the pad bucket is implicit
+            table->src[1] = Rcur;                // [n_rel, n_head, n_tokens]
+            table->src[2] = sinks;               // [1, n_head, n_tokens]
+            ggml_set_name(table, "inkling2_relbias");
+            ggml_build_forward_expand(gf, table);
+            cb(table, "rel_bias", il);
         }
-        if (table) cb(table, "rel_bias", il);
 
         // the zero sink is the same for every layer with the same head count
         ggml_tensor *& zero = zero_sinks[n_head];

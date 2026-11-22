@@ -563,6 +563,60 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // short-hand
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
 
+        // op ごとの GPU 時間を測るモード: 1 node = 1 command buffer にして直列化する
+        // (融合・並列は効かなくなるが、どの op が時間を使っているかの帰属が分かる)
+        if (getenv("GGML_METAL_PROFILE_GPU")) {
+            const int64_t t_loop_start = ggml_time_us();
+            const char * slow_env = getenv("GGML_METAL_PROFILE_SLOW");
+            const double slow_ms = slow_env ? atof(slow_env) : -1.0;
+            for (int idx = 0; idx < gf->n_nodes; ++idx) {
+                id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+
+                ggml_metal_op_t ctx_op = ggml_metal_op_init(
+                    ctx->dev, cmd_buf, gf, ctx->finfo, idx, idx + 1,
+                    ctx->use_concurrency, ctx->capture_compute == 0, ctx->debug_graph);
+
+                for (int i = 0; i < ggml_metal_op_n_nodes(ctx_op); ++i) {
+                    const int r = ggml_metal_op_encode(ctx_op, i);
+                    if (r == 0) {
+                        break;
+                    }
+                    i += r - 1;
+                }
+
+                ggml_metal_op_free(ctx_op);
+
+                [cmd_buf commit];
+                [cmd_buf waitUntilCompleted];
+
+                const NSTimeInterval t = [cmd_buf GPUEndTime] - [cmd_buf GPUStartTime];
+
+                if (slow_ms > 0 && t*1e3 >= slow_ms) {
+                    const struct ggml_tensor * node = gf->nodes[idx];
+                    fprintf(stderr, "[metal-slow] %8.2f ms  %-16s %-28s [%lld,%lld,%lld,%lld] src0=%s[%lld,%lld,%lld]\n",
+                            t*1e3, ggml_op_name(node->op), node->name ? node->name : "",
+                            (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3],
+                            node->src[0] ? ggml_op_name(node->src[0]->op) : "-",
+                            node->src[0] ? (long long) node->src[0]->ne[0] : 0,
+                            node->src[0] ? (long long) node->src[0]->ne[1] : 0,
+                            node->src[0] ? (long long) node->src[0]->ne[2] : 0);
+                }
+
+                ggml_metal_ops_profile_time_add(gf->nodes[idx]->op, t > 0 ? (uint64_t) (t*1e9) : 0);
+            }
+
+            ctx->cmd_buf_last = nil;
+
+            fprintf(stderr, "[metal-time] nodes=%d wall(loop)=%.2f ms\n", gf->n_nodes, (ggml_time_us() - t_loop_start)/1000.0);
+
+            if (getenv("GGML_METAL_PROFILE")) {
+                ggml_metal_ops_profile_dump();
+            }
+            ggml_metal_ops_profile_time_dump();
+
+            return GGML_STATUS_SUCCESS;
+        }
+
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
         {

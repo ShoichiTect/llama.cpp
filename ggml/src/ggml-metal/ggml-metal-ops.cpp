@@ -193,6 +193,40 @@ static std::atomic<uint64_t> g_prof_counts[GGML_OP_COUNT];
 static std::atomic<uint64_t> g_prof_total{0};
 static std::atomic<uint64_t> g_prof_fused{0};
 
+// --- op ごとの GPU 時間(GGML_METAL_PROFILE_GPU=1 で有効)---
+// 1 node = 1 command buffer で encode + wait し、GPUStartTime/GPUEndTime の差を積む
+static std::atomic<uint64_t> g_prof_ns[GGML_OP_COUNT];
+static std::atomic<uint64_t> g_prof_tcount[GGML_OP_COUNT];
+
+extern "C" void ggml_metal_ops_profile_time_add(enum ggml_op op, uint64_t ns) {
+    g_prof_ns[op].fetch_add(ns);
+    g_prof_tcount[op].fetch_add(1);
+}
+
+extern "C" void ggml_metal_ops_profile_time_dump(void) {
+    uint64_t total = 0;
+    for (int op = 0; op < GGML_OP_COUNT; ++op) {
+        total += g_prof_ns[op].load();
+    }
+
+    fprintf(stderr, "[metal-time] GPU total %.2f ms (op ごとに直列化した合計)\n", total/1e6);
+
+    for (int k = 0; k < GGML_OP_COUNT; ++k) {
+        int best = -1; uint64_t bestv = 0;
+        for (int op = 0; op < GGML_OP_COUNT; ++op) {
+            const uint64_t v = g_prof_ns[op].load();
+            if (v > bestv) { bestv = v; best = op; }
+        }
+        if (best < 0 || bestv == 0) break;
+        const uint64_t n = g_prof_tcount[best].load();
+        fprintf(stderr, "[metal-time]   %-18s %9.3f ms  %5.1f%%  n=%6llu  avg=%8.1f us\n",
+                ggml_op_name((enum ggml_op) best), bestv/1e6, 100.0*(double)bestv/(double)(total ? total : 1),
+                (unsigned long long) n, n ? (double)bestv/1e3/(double)n : 0.0);
+        g_prof_ns[best].store(0);
+        g_prof_tcount[best].store(0);
+    }
+}
+
 extern "C" void ggml_metal_ops_profile_dump(void) {
     const uint64_t total = g_prof_total.load();
     fprintf(stderr, "[metal-prof] dispatches=%llu (fused nodes skipped=%llu)\n",
@@ -373,6 +407,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_INKLING2_CTRL:
             {
                 n_fuse = ggml_metal_op_inkling2_ctrl(ctx, idx);
+            } break;
+        case GGML_OP_INKLING2_RELBIAS:
+            {
+                n_fuse = ggml_metal_op_inkling2_relbias(ctx, idx);
             } break;
         case GGML_OP_INKLING2_CONV_STATE:
             {
@@ -1169,6 +1207,49 @@ int ggml_metal_op_inkling2_ctrl(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         5);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, (nt + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_inkling2_relbias(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    ggml_metal_kargs_inkling2_relbias args = {
+        /*.n_rel    =*/ (int32_t) op->src[0]->ne[0],
+        /*.n_ext    =*/ (int32_t) op->src[0]->ne[1],
+        /*.ne0      =*/ (int32_t) op->ne[0],
+        /*.ne1      =*/ (int32_t) op->ne[1],
+        /*.ne2      =*/ (int32_t) op->ne[2],
+        /*.nth_t    =*/ 4,
+        /*.nb1_bias =*/ (int64_t) op->src[0]->nb[1],
+        /*.nb1_r    =*/ (int64_t) op->src[1]->nb[1],
+        /*.nb2_r    =*/ (int64_t) op->src[1]->nb[2],
+        /*.nb1_sink =*/ (int64_t) op->src[2]->nb[1],
+        /*.nb2_sink =*/ (int64_t) op->src[2]->nb[2],
+    };
+
+    char base[256];
+    snprintf(base, 256, "kernel_inkling2_relbias");
+
+    ggml_metal_pipeline_with_params pipeline = ggml_metal_library_get_pipeline(lib, base);
+    if (!pipeline.pipeline) {
+        pipeline = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+
+    // threadgroup (32 heads, 4 tokens); the grid is a single column of token tiles
+    const int64_t ntg_y = (op->ne[2] + args.nth_t - 1)/args.nth_t;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         4);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, 1, ntg_y, 1, 32, args.nth_t, 1);
 
     return 1;
 }

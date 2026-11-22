@@ -1989,6 +1989,47 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                     }
                 }
             } break;
+        case GGML_OP_INKLING2_RELBIAS:
+            {
+                // out[h, e, t] = sum_i bias[i, e]*r[i, h, t] - sink[h, t]
+                const struct ggml_tensor * bias = tensor->src[0]; // [n_rel, n_ext]
+                const struct ggml_tensor * r    = tensor->src[1]; // [n_rel, n_head, n_tokens]
+                const struct ggml_tensor * sink = tensor->src[2]; // [1, n_head, n_tokens]
+
+                const int64_t n_rel  = bias->ne[0];
+                const int64_t n_ext  = bias->ne[1];
+                const int64_t ne0    = tensor->ne[0]; // n_head
+                const int64_t ne1    = tensor->ne[1]; // n_ext + 1
+                const int64_t ne2    = tensor->ne[2]; // n_tokens
+
+                const char * bd = (const char *) bias->data;
+                const char * rd = (const char *) r->data;
+                const char * sd = (const char *) sink->data;
+                float      * od = (float *) tensor->data;
+
+                const int ith = params->ith;
+                const int nth = params->nth;
+
+                const int64_t n_rows = ne0*ne2;
+                for (int64_t row = ith; row < n_rows; row += nth) {
+                    const int64_t h = row % ne0;
+                    const int64_t t = row / ne0;
+
+                    const char * ph = rd + h*r->nb[1] + t*r->nb[2];
+                    const float  sv = *(const float *) (sd + h*sink->nb[1] + t*sink->nb[2]);
+
+                    for (int64_t e = 0; e < ne1; ++e) {
+                        float sum = 0.0f;
+                        if (e < n_ext) {
+                            for (int64_t i = 0; i < n_rel; ++i) {
+                                sum += *(const float *) (bd + i*bias->nb[0] + e*bias->nb[1]) *
+                                       *(const float *) (ph + i*r->nb[0]);
+                            }
+                        }
+                        od[h + ne0*(e + ne1*t)] = sum - sv;
+                    }
+                }
+            } break;
         case GGML_OP_INKLING2_CONV_STATE:
             {
                 // the cell holds the last n_cols rows of the padded buffer, as [lag, channel]
@@ -2661,6 +2702,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_INKLING2_CTRL:
         case GGML_OP_INKLING2_GATE:
         case GGML_OP_INKLING2_SITU:
+        case GGML_OP_INKLING2_RELBIAS:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:

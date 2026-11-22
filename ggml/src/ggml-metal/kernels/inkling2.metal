@@ -139,6 +139,75 @@ kernel void kernel_inkling2_ctrl(
     out[gid] = (c - p) + q;
 }
 
+// the relative bias table: out[h, e, t] = sum_i bias[i, e]*r[i, h, t] - sink[h, t]
+// the bucket past the table (e == ne1 - 1) sums nothing, so it is -sink
+// (one dispatch instead of mul_mat(k = n_rel) + sub + cont(permute), which were ~30% of prefill)
+//
+// one thread per (h, t): r[i, h, t] stays in registers and the inner loop streams the bias rows.
+// all threads of a warp walk the same e, so the 64B bias row is a broadcast load, and the
+// threadgroup covers consecutive h, so the row it writes is contiguous.
+kernel void kernel_inkling2_relbias(
+        constant ggml_metal_kargs_inkling2_relbias & args,
+        device const char * bias,
+        device const char * r,
+        device const char * sink,
+        device       char * dst,
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        uint2 tiitg [[thread_position_in_threadgroup]]) {
+    const int64_t h = (int64_t) tiitg.x;
+    const int64_t t = (int64_t) tgpig.y*args.nth_t + tiitg.y;
+    if (h >= args.ne0 || t >= args.ne2) {
+        return;
+    }
+
+    const device float * pr = (device const float *) (r    + h*args.nb1_r    + t*args.nb2_r);
+    const float          sv = *(device const float *) (sink + h*args.nb1_sink + t*args.nb2_sink);
+
+    device float * pd = (device float *) dst + h + args.ne0*args.ne1*t;
+
+    if (args.n_rel == 16) {
+        float4 rv0 = *(device const float4 *) (pr +  0);
+        float4 rv1 = *(device const float4 *) (pr +  4);
+        float4 rv2 = *(device const float4 *) (pr +  8);
+        float4 rv3 = *(device const float4 *) (pr + 12);
+
+        for (int64_t e = 0; e < args.ne1; ++e, pd += args.ne0) {
+            float sum = 0.0f;
+            if (e < args.n_ext) {
+                // bias is [n_rel, n_ext]: the row for e is n_rel contiguous floats at e*nb1
+                const device float4 * pb = (device const float4 *) (bias + e*args.nb1_bias);
+                const float4 b0 = pb[0];
+                const float4 b1 = pb[1];
+                const float4 b2 = pb[2];
+                const float4 b3 = pb[3];
+                sum = (b0.x*rv0.x + b0.y*rv0.y + b0.z*rv0.z + b0.w*rv0.w)
+                    + (b1.x*rv1.x + b1.y*rv1.y + b1.z*rv1.z + b1.w*rv1.w)
+                    + (b2.x*rv2.x + b2.y*rv2.y + b2.z*rv2.z + b2.w*rv2.w)
+                    + (b3.x*rv3.x + b3.y*rv3.y + b3.z*rv3.z + b3.w*rv3.w);
+            }
+            pd[0] = sum - sv;
+        }
+
+        return;
+    }
+
+    float rv[32];
+    for (int i = 0; i < args.n_rel && i < 32; ++i) {
+        rv[i] = pr[i];
+    }
+
+    for (int64_t e = 0; e < args.ne1; ++e, pd += args.ne0) {
+        float sum = 0.0f;
+        if (e < args.n_ext) {
+            const device char * pb = bias + e*args.nb1_bias;
+            for (int i = 0; i < args.n_rel; ++i) {
+                sum += *(device const float *) (pb + i*4) * rv[i];
+            }
+        }
+        pd[0] = sum - sv;
+    }
+}
+
 // rms_norm(cur) || rms_norm(message): the reduction is the same one as kernel_rms_norm_f32
 // (float4 chunks, per-simdgroup simd_sum, then across the simdgroups), so the result is bit-identical
 kernel void kernel_inkling2_gate(

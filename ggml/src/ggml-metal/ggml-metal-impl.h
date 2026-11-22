@@ -262,6 +262,21 @@ struct ggml_metal_kargs_inkling2_ctrl {
     int64_t nb1_forget;
 };
 
+// inkling2: the relative bias table, out[h, e, t] = sum_i bias[i, e]*r[i, h, t] - sink[h, t]
+struct ggml_metal_kargs_inkling2_relbias {
+    int32_t n_rel;
+    int32_t n_ext;
+    int32_t ne0;
+    int32_t ne1;
+    int32_t ne2;
+    int32_t nth_t;
+    int64_t nb1_bias;
+    int64_t nb1_r;
+    int64_t nb2_r;
+    int64_t nb1_sink;
+    int64_t nb2_sink;
+};
+
 // inkling2: the whole short-conv chain (taps + optional dynamic taps + residual + scale)
 struct ggml_metal_kargs_inkling2_conv {
     int32_t n_conv;
