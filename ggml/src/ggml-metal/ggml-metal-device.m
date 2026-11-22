@@ -1551,6 +1551,17 @@ static bool ggml_metal_supports_mul_mat_op(
 }
 
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
+    // デバッグ用: GGML_METAL_SKIP_INKLING2=CLIP,CONV,... で特定の融合 op を CPU に落とす
+    if (op->op >= GGML_OP_INKLING2_CLIP && op->op <= GGML_OP_INKLING2_SITU) {
+        const char * skip = getenv("GGML_METAL_SKIP_INKLING2");
+        if (skip && skip[0]) {
+            const char * name = ggml_op_name(op->op) + 9; // skip the "INKLING2_" prefix
+            if (strstr(skip, name)) {
+                return false;
+            }
+        }
+    }
+
     if (op->op == GGML_OP_INKLING2_SITU) {
         if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
             return false;

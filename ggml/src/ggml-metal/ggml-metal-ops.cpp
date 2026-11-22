@@ -197,8 +197,8 @@ extern "C" void ggml_metal_ops_profile_dump(void) {
     const uint64_t total = g_prof_total.load();
     fprintf(stderr, "[metal-prof] dispatches=%llu (fused nodes skipped=%llu)\n",
             (unsigned long long) total, (unsigned long long) g_prof_fused.load());
-    // 多い順に上位 15 を出す
-    for (int k = 0; k < 15; ++k) {
+    // 多い順に全部出す
+    for (int k = 0; k < GGML_OP_COUNT; ++k) {
         int best = -1; uint64_t bestv = 0;
         for (int op = 0; op < GGML_OP_COUNT; ++op) {
             const uint64_t v = g_prof_counts[op].load();

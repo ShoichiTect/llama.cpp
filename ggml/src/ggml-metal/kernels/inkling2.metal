@@ -162,6 +162,9 @@ kernel void kernel_inkling2_gate(
         device const float4 * x = part ? xm : xc;
         device       float4 * o = part ? y + args.ne0_t : y;
 
+        // the previous part still reads shmem_f32 (sumf = shmem_f32[tiisg]) below, so wait for it
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         if (sgitg == 0) {
             shmem_f32[tiisg] = 0.0f;
         }
