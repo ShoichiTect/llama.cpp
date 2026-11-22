@@ -653,12 +653,24 @@ static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgrap
     ggml_metal_graph_optimize(ctx, cgraph);
 }
 
+// env override, for the n_cb sweep (GGML_METAL_N_CB=0..N)
+static int ggml_backend_metal_n_cb_env(int n_cb) {
+    const char * env = getenv("GGML_METAL_N_CB");
+    if (env) {
+        const int v = atoi(env);
+        if (v >= 0) {
+            return v;
+        }
+    }
+    return n_cb;
+}
+
 static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
-    ggml_metal_set_n_cb(ctx, n_cb);
+    ggml_metal_set_n_cb(ctx, ggml_backend_metal_n_cb_env(n_cb));
 }
 
 static ggml_backend_i ggml_backend_metal_i = {
