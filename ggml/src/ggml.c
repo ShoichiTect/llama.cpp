@@ -1124,9 +1124,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "INKLING2_SITU",
     "INKLING2_CONV_STATE",
     "INKLING2_RELBIAS",
+    "INKLING2_MASK",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1241,7 +1242,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 

@@ -4530,7 +4530,24 @@ ggml_tensor * llm_graph_context::build_attn(
     // the full-attention layers write the mask a few query rows at a time, at most 32 chunks
     const int64_t n_rows = is_swa ? n_tps : std::max<int64_t>(32, (n_tps + 31)/32);
 
-    if (n_rows >= n_tps) {
+    // one fused op for the whole mask when it is a plain [n_kv, t] bias: the generic path below
+    // moves ~130 MB per layer (gather, transposing copy, add, cast) at a few GB/s
+    const bool can_fuse = rel_bias->op == GGML_OP_INKLING2_RELBIAS &&
+        rel_bias->src[0] && rel_bias->src[1] && rel_bias->src[2] &&
+        (mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32) &&
+        n_kv*n_tps*n_head*n_stream*ggml_type_size(mask->type) <= (size_t) 256*1024*1024;
+
+    if (can_fuse) {
+        ggml_tensor * fused = ggml_new_tensor_4d(ctx0, mask->type, n_kv, n_tps, n_head, n_stream);
+        fused->op     = GGML_OP_INKLING2_MASK;
+        fused->src[0] = rel_bias->src[0]; // [n_rel, n_bucket], the pad bucket is a zero row
+        fused->src[1] = rel_bias->src[1]; // [n_rel, n_head, n_tokens]
+        fused->src[2] = rel_bias->src[2]; // [1, n_head, n_tokens]
+        fused->src[3] = rel_pos;          // i32 [n_kv, n_tps, n_stream]
+        fused->src[4] = mask;             // base mask, broadcast over the heads
+
+        kq_mask = fused;
+    } else if (n_rows >= n_tps) {
         // [n_head, n_kv, n_tokens] -> [n_kv, n_tps, n_head, n_stream]
         ggml_tensor * kq_b = ggml_get_rows(ctx0, rel_bias, rel_pos);
         kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tps, n_stream);

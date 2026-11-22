@@ -412,6 +412,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_inkling2_relbias(ctx, idx);
             } break;
+        case GGML_OP_INKLING2_MASK:
+            {
+                n_fuse = ggml_metal_op_inkling2_mask(ctx, idx);
+            } break;
         case GGML_OP_INKLING2_CONV_STATE:
             {
                 n_fuse = ggml_metal_op_inkling2_conv_state(ctx, idx);
@@ -1290,6 +1294,68 @@ int ggml_metal_op_inkling2_relbias(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         4);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, (int) ntg_x, (int) ntg_y, 1, 32, args.nth_t, 1);
+
+    return 1;
+}
+
+
+int ggml_metal_op_inkling2_mask(ggml_metal_op_t ctx, int idx) {
+    ggml_metal_op_t ctx_op = ctx;
+    ggml_tensor * op = ctx_op->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * bias = op->src[0]; // [n_rel, n_bucket]
+    const ggml_tensor * r    = op->src[1]; // [n_rel, n_head, n_tokens]
+    const ggml_tensor * sink = op->src[2]; // [1, n_head, n_tokens]
+    const ggml_tensor * pos  = op->src[3]; // i32 [n_kv, n_tps*n_stream]
+    const ggml_tensor * mask = op->src[4]; // [n_kv, n_tps, 1, n_stream]
+
+    const int32_t nth_kv = 64;
+
+    ggml_metal_kargs_inkling2_mask args = {
+        /*.n_rel    =*/ (int32_t) bias->ne[0],
+        /*.n_ext    =*/ (int32_t) bias->ne[1],
+        /*.n_kv     =*/ (int32_t) op->ne[0],
+        /*.n_tps    =*/ (int32_t) op->ne[1],
+        /*.n_head   =*/ (int32_t) op->ne[2],
+        /*.n_stream =*/ (int32_t) op->ne[3],
+        /*.src_f16  =*/ mask->type == GGML_TYPE_F16 ? 1 : 0,
+        /*.dst_f16  =*/ op->type == GGML_TYPE_F16 ? 1 : 0,
+        /*.nth_kv   =*/ nth_kv,
+        /*.nb1_b    =*/ (int64_t) bias->nb[1],
+        /*.nb1_r    =*/ (int64_t) r->nb[1],
+        /*.nb2_r    =*/ (int64_t) r->nb[2],
+        /*.nb1_sink =*/ (int64_t) sink->nb[1],
+        /*.nb2_sink =*/ (int64_t) sink->nb[2],
+        /*.nb1_pos  =*/ (int64_t) pos->nb[0],
+        /*.nb2_pos  =*/ (int64_t) pos->nb[1],
+        /*.nb1_m    =*/ (int64_t) mask->nb[0],
+        /*.nb2_m    =*/ (int64_t) mask->nb[1],
+        /*.nb3_m    =*/ (int64_t) mask->nb[3],
+    };
+
+    char base[256];
+    snprintf(base, 256, "kernel_inkling2_mask");
+
+    ggml_metal_pipeline_with_params pipeline = ggml_metal_library_get_pipeline(lib, base);
+    if (!pipeline.pipeline) {
+        pipeline = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(bias), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(r),    2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sink), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(pos),  4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mask), 5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),   6);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc,
+            (int) ((op->ne[0] + nth_kv - 1)/nth_kv), (int) (op->ne[1]*op->ne[3]), (int) op->ne[2],
+            nth_kv, 1, 1);
 
     return 1;
 }

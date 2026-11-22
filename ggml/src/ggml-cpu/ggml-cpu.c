@@ -1989,6 +1989,68 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                     }
                 }
             } break;
+        case GGML_OP_INKLING2_MASK:
+            {
+                // out[kv, t, h, s] = bias[:, rel_pos[kv, t, s]] . r[:, h, t] - sink[h, t] + mask[kv, t, s]
+                const struct ggml_tensor * bias = tensor->src[0]; // [n_rel, n_bucket], the last bucket is the pad
+                const struct ggml_tensor * r    = tensor->src[1]; // [n_rel, n_head, n_tokens]
+                const struct ggml_tensor * sink = tensor->src[2]; // [1, n_head, n_tokens]
+                const struct ggml_tensor * pos  = tensor->src[3]; // i32 [n_kv, n_tps, n_stream]
+                const struct ggml_tensor * mask = tensor->src[4]; // [n_kv, n_tps, 1, n_stream]
+
+                const int64_t n_rel    = bias->ne[0];
+                const int64_t n_ext    = bias->ne[1];
+                const int64_t n_kv     = tensor->ne[0];
+                const int64_t n_tps    = tensor->ne[1];
+                const int64_t n_head   = tensor->ne[2];
+                const int64_t n_stream = tensor->ne[3];
+
+                const char * bd = (const char *) bias->data;
+                const char * rd = (const char *) r->data;
+                const char * sd = (const char *) sink->data;
+                const char * pd = (const char *) pos->data;
+                const char * md = (const char *) mask->data;
+
+                const int ith = params->ith;
+                const int nth = params->nth;
+
+                const bool dst_f16 = tensor->type == GGML_TYPE_F16;
+                const bool src_f16 = mask->type == GGML_TYPE_F16;
+
+                const int64_t n_rows = n_tps*n_head*n_stream;
+                for (int64_t row = ith; row < n_rows; row += nth) {
+                    const int64_t h = row % n_head;
+                    const int64_t t = (row / n_head) % n_tps;
+                    const int64_t s = row / (n_head*n_tps);
+
+                    const char * ph = rd + h*r->nb[1] + (t + n_tps*s)*r->nb[2];
+                    const float  sv = *(const float *) (sd + h*sink->nb[1] + (t + n_tps*s)*sink->nb[2]);
+
+                    for (int64_t kv = 0; kv < n_kv; ++kv) {
+                        const int64_t b = *(const int32_t *) (pd + kv*pos->nb[0] + t*pos->nb[1] + s*pos->nb[2]);
+
+                        float sum = 0.0f;
+                        if (b < n_ext) {
+                            for (int64_t i = 0; i < n_rel; ++i) {
+                                sum += *(const float *) (bd + i*bias->nb[0] + b*bias->nb[1]) *
+                                       *(const float *) (ph + i*r->nb[0]);
+                            }
+                        }
+
+                        const char * pm = md + kv*mask->nb[0] + t*mask->nb[1] + s*mask->nb[3];
+                        const float  mv = src_f16 ? ggml_fp16_to_fp32(*(const ggml_fp16_t *) pm)
+                                                  : *(const float *) pm;
+
+                        const float v = (sum - sv) + mv;
+                        char * po = (char *) tensor->data + (kv + n_kv*(t + n_tps*(h + n_head*s)))*ggml_element_size(tensor);
+                        if (dst_f16) {
+                            *(ggml_fp16_t *) po = ggml_fp32_to_fp16(v);
+                        } else {
+                            *(float *) po = v;
+                        }
+                    }
+                }
+            } break;
         case GGML_OP_INKLING2_RELBIAS:
             {
                 // out[h, e, t] = sum_i bias[i, e]*r[i, h, t] - sink[h, t]
@@ -2703,6 +2765,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_INKLING2_GATE:
         case GGML_OP_INKLING2_SITU:
         case GGML_OP_INKLING2_RELBIAS:
+        case GGML_OP_INKLING2_MASK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:

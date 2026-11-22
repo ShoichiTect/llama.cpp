@@ -452,7 +452,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             table->src[1] = Rcur;                // [n_rel, n_head, n_tokens]
             table->src[2] = sinks;               // [1, n_head, n_tokens]
             ggml_set_name(table, "inkling2_relbias");
-            ggml_build_forward_expand(gf, table);
+            // not expanded here: the attention mask op consumes r/sinks/the weights directly and
+            // the table itself is only computed on the backends that take the generic path
             cb(table, "rel_bias", il);
         }
 

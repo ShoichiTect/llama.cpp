@@ -363,3 +363,60 @@ kernel void kernel_inkling2_situ(
         }
     }
 }
+
+// the attention mask of the relative bias: one dispatch instead of
+//   get_rows(bias table, rel_pos) -> cont(permute) -> add(base mask) -> cast(f16)
+// which was ~130 MB of traffic per layer at 20 GB/s (~8.3 ms/layer, 22% of prefill).
+//
+//   out[kv, t, h, s] = bias[:, pos[kv,t,s]] . r[:, h, t] - sink[h, t] + mask[kv, t, s]
+//
+// the mask is written in its final [n_kv, n_tps, n_head, n_stream] layout, so the transposing copy
+// disappears, and the 16-element dot is computed on the fly: r is a broadcast load (same address for
+// the whole threadgroup) and the bias table (n_rel x n_bucket) is a few tens of KB that stays in L2.
+kernel void kernel_inkling2_mask(
+        constant ggml_metal_kargs_inkling2_mask & args,
+        device const char * bias,
+        device const char * r,
+        device const char * sink,
+        device const char * pos,
+        device const char * mask,
+        device       char * dst,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tiitg [[thread_position_in_threadgroup]]) {
+    const int64_t h = (int64_t) tgpig.z;
+    const int64_t t = (int64_t) tgpig.y % args.n_tps;
+    const int64_t s = (int64_t) tgpig.y / args.n_tps;
+
+    const int64_t kv = (int64_t) tgpig.x*args.nth_kv + (int64_t) tiitg.x;
+    if (kv >= args.n_kv || h >= args.n_head) {
+        return;
+    }
+
+    const int64_t tok = t + args.n_tps*s;
+
+    // broadcast: the whole threadgroup reads the same 64B of r and one sink value
+    const device char * pr = r + h*args.nb1_r + tok*args.nb2_r;
+    const float          sv = *(device const float *) (sink + h*args.nb1_sink + tok*args.nb2_sink);
+
+    const int32_t b = *(device const int *) (pos + kv*args.nb1_pos + (t + args.n_tps*s)*args.nb2_pos);
+
+    float sum = 0.0f;
+    if (b < args.n_ext) {
+        const device char * pb = bias + (int64_t) b*args.nb1_b;
+        for (int i = 0; i < args.n_rel; ++i) {
+            sum += (*(device const float *) (pb + i*4)) * (*(device const float *) (pr + i*4));
+        }
+    }
+
+    const device char * pm = mask + kv*args.nb1_m + t*args.nb2_m + s*args.nb3_m;
+    const float mv = args.src_f16 ? (float) (*(device const half *) pm) : *(device const float *) pm;
+
+    const float v = (sum - sv) + mv;
+
+    device char * pd = dst + (kv + args.n_kv*(tok + args.n_tps*(h + (int64_t) args.n_head*s)))*(args.dst_f16 ? 2 : 4);
+    if (args.dst_f16) {
+        *(device half *) pd = (half) v;
+    } else {
+        *(device float *) pd = v;
+    }
+}
