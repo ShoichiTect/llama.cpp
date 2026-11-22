@@ -1415,7 +1415,7 @@ int ggml_metal_op_inkling2_mask(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),   6);
 
     ggml_metal_encoder_dispatch_threadgroups(enc,
-            (int) ((op->ne[0] + nth_kv - 1)/nth_kv), (int) (op->ne[1]*op->ne[3]), (int) op->ne[2],
+            (int) ((op->ne[0] + nth_kv - 1)/nth_kv), (int) (op->ne[1]*op->ne[3]), 1,
             nth_kv, 1, 1);
 
     return 1;

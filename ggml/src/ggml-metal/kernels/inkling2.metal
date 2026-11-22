@@ -382,90 +382,101 @@ kernel void kernel_inkling2_mask(
         device const char * mask,
         device       char * dst,
         uint3  tgpig [[threadgroup_position_in_grid]],
-        uint3  tiitg [[thread_position_in_threadgroup]],
-        ushort tiisg [[thread_index_in_simdgroup]]) {
-    const int64_t h  = (int64_t) tgpig.z;
-    const int64_t t  = (int64_t) tgpig.y % args.n_tps;
-    const int64_t s  = (int64_t) tgpig.y / args.n_tps;
+        uint3  tiitg [[thread_position_in_threadgroup]]) {
+    const int32_t t  = (int32_t) tgpig.y % args.n_tps;
+    const int32_t s  = (int32_t) tgpig.y / args.n_tps;
+    const int32_t kv = (int32_t) tgpig.x*args.nth_kv + (int32_t) tiitg.x;
+    const int32_t tok = t + args.n_tps*s;
 
-    const int64_t kv = (int64_t) tgpig.x*args.nth_kv + (int64_t) tiitg.x;
-    const bool    on = kv < args.n_kv;
+    // r and the sinks are shared by all the kv of this token, so the whole threadgroup stages them
+    // once in threadgroup memory instead of each lane reading them for each head (this op used to be
+    // 1 thread = 1 (kv, t, h), i.e. 146k threadgroups of one output element, which is launch bound)
+    threadgroup float4 sh_r[4*64]; // [n_head][4] = n_rel = 16 channels
+    threadgroup float  sh_s[64];
 
-    const int64_t tok = t + args.n_tps*s;
-
-    // broadcast: the whole threadgroup reads the same 64B of r and one sink value
-    const device char * pr = r + h*args.nb1_r + tok*args.nb2_r;
-    const float          sv = *(device const float *) (sink + h*args.nb1_sink + tok*args.nb2_sink);
-
-    // the lanes past n_kv keep a sentinel bucket, so that the simdgroup code below runs in uniform
-    // control flow (simd_min / simd_shuffle are undefined if part of the simdgroup is inactive)
-    const int32_t b = on
-        ? *(device const int *) (pos + kv*args.nb1_pos + tok*args.nb2_pos)
-        : args.n_ext;
-
-    // the 16 bias values of bucket b are one 64B row, and consecutive kv ask for consecutive buckets.
-    // gathering them per lane issues one 64B transaction per lane per element (32 lanes -> 2 KB of
-    // sectors for 128 B of data), which alone made this the second slowest op of prefill.
-    // instead the simdgroup loads the window of buckets cooperatively (one row per lane, the rows are
-    // adjacent so the loads coalesce) and each lane shuffles out the row it needs.
-    float4 bs[4] = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
-
-    float sum = 0.0f;
-
-    if (args.n_rel == 16) {
-        const int32_t lo  = simd_min(b);
-        const int32_t id  = b - lo;
-        const int32_t own = lo + (int32_t) tiisg;
-
-        // warp-uniform: when the buckets of this simdgroup do not fit in one window, gather directly
-        if (simd_max(id) >= 32) {
-            if (b < args.n_ext) {
-                const device char * pb = bias + (int64_t) b*args.nb1_b;
-                for (int i = 0; i < args.n_rel; ++i) {
-                    sum += (*(device const float *) (pb + i*4)) * (*(device const float *) (pr + i*4));
-                }
-            }
+    for (int32_t i = (int32_t) tiitg.x; i < args.n_head; i += args.nth_kv) {
+        const device char * pr = r + i*args.nb1_r + tok*args.nb2_r;
+        if (args.n_rel == 16) {
+            sh_r[i*4 + 0] = *(device const float4 *) (pr +  0);
+            sh_r[i*4 + 1] = *(device const float4 *) (pr + 16);
+            sh_r[i*4 + 2] = *(device const float4 *) (pr + 32);
+            sh_r[i*4 + 3] = *(device const float4 *) (pr + 48);
         } else {
-
-        if (own >= 0 && own < args.n_ext) {
-            const device char * pb = bias + (int64_t) own*args.nb1_b;
-            bs[0] = *(device const float4 *) (pb +  0);
-            bs[1] = *(device const float4 *) (pb + 16);
-            bs[2] = *(device const float4 *) (pb + 32);
-            bs[3] = *(device const float4 *) (pb + 48);
-        }
-
-            for (int k = 0; k < 4; ++k) {
-                const float4 bv = float4(
-                        simd_shuffle(bs[k].x, ushort(id)), simd_shuffle(bs[k].y, ushort(id)),
-                        simd_shuffle(bs[k].z, ushort(id)), simd_shuffle(bs[k].w, ushort(id)));
-                const float4 rv = *(device const float4 *) (pr + (k*4)*4);
-                sum += (bv.x*rv.x + bv.y*rv.y + bv.z*rv.z + bv.w*rv.w);
+            for (int32_t k = 0; k < 4; ++k) {
+                sh_r[i*4 + k] = float4(0.0f);
             }
-
-            sum = b < args.n_ext ? sum : 0.0f;
+            for (int32_t k = 0; k < args.n_rel; ++k) {
+                ((threadgroup float *) sh_r)[i*16 + k] = *(device const float *) (pr + k*4);
+            }
         }
-    } else if (b < args.n_ext) {
-        const device char * pb = bias + (int64_t) b*args.nb1_b;
-        for (int i = 0; i < args.n_rel; ++i) {
-            sum += (*(device const float *) (pb + i*4)) * (*(device const float *) (pr + i*4));
-        }
+        sh_s[i] = *(device const float *) (sink + i*args.nb1_sink + tok*args.nb2_sink);
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (!on) {
+    if (kv >= args.n_kv) {
         return;
     }
 
+    // the bias row of this bucket (16 channels, one 64B row) and the base mask value are used for
+    // every head, so they are loaded once per (kv, t)
+    const int32_t b   = *(device const int *) (pos + kv*args.nb1_pos + tok*args.nb2_pos);
+    const bool    has = b < args.n_ext;
+
+    float4 br[4] = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
+    if (has && args.n_rel == 16) {
+        const device char * pb = bias + (int64_t) b*args.nb1_b;
+        br[0] = *(device const float4 *) (pb +  0);
+        br[1] = *(device const float4 *) (pb + 16);
+        br[2] = *(device const float4 *) (pb + 32);
+        br[3] = *(device const float4 *) (pb + 48);
+    }
+
     const device char * pm = mask + kv*args.nb1_m + t*args.nb2_m + s*args.nb3_m;
-    const float mv = args.src_f16 ? (float) (*(device const half *) pm) : *(device const float *) pm;
+    const float         mv = args.src_f16 ? (float) (*(device const half *) pm) : *(device const float *) pm;
 
-    const float v = (sum - sv) + mv;
+    device char * pd = dst + (kv + args.n_kv*((int64_t) tok + args.n_tps*args.n_head*s))*(args.dst_f16 ? 2 : 4);
 
-    device char * pd = dst + (kv + args.n_kv*(tok + args.n_tps*(h + (int64_t) args.n_head*s)))*(args.dst_f16 ? 2 : 4);
-    if (args.dst_f16) {
-        *(device half *) pd = (half) v;
+    if (args.n_rel == 16 && has) {
+        for (int32_t h = 0; h < args.n_head; ++h) {
+            const float4 q0 = sh_r[h*4 + 0];
+            const float4 q1 = sh_r[h*4 + 1];
+            const float4 q2 = sh_r[h*4 + 2];
+            const float4 q3 = sh_r[h*4 + 3];
+
+            const float sum = (br[0].x*q0.x + br[0].y*q0.y + br[0].z*q0.z + br[0].w*q0.w) +
+                              (br[1].x*q1.x + br[1].y*q1.y + br[1].z*q1.z + br[1].w*q1.w) +
+                              (br[2].x*q2.x + br[2].y*q2.y + br[2].z*q2.z + br[2].w*q2.w) +
+                              (br[3].x*q3.x + br[3].y*q3.y + br[3].z*q3.z + br[3].w*q3.w);
+
+            const float v = (sum - sh_s[h]) + mv;
+
+            device char * po = pd + (int64_t) h*args.n_kv*args.n_tps*(args.dst_f16 ? 2 : 4);
+            if (args.dst_f16) {
+                *(device half *) po = (half) v;
+            } else {
+                *(device float *) po = v;
+            }
+        }
     } else {
-        *(device float *) pd = v;
+        for (int32_t h = 0; h < args.n_head; ++h) {
+            float sum = 0.0f;
+            if (has) {
+                const device char * pb = bias + (int64_t) b*args.nb1_b;
+                const threadgroup float * pr = (const threadgroup float *) sh_r + h*16;
+                for (int32_t k = 0; k < args.n_rel; ++k) {
+                    sum += (*(device const float *) (pb + k*4))*pr[k];
+                }
+            }
+
+            const float v = (sum - sh_s[h]) + mv;
+
+            device char * po = pd + (int64_t) h*args.n_kv*args.n_tps*(args.dst_f16 ? 2 : 4);
+            if (args.dst_f16) {
+                *(device half *) po = (half) v;
+            } else {
+                *(device float *) po = v;
+            }
+        }
     }
 }
 

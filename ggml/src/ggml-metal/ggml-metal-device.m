@@ -1618,6 +1618,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         const struct ggml_tensor * sink = op->src[2];
         const struct ggml_tensor * pos  = op->src[3];
         const struct ggml_tensor * mask = op->src[4];
+        if (op->ne[2] > 64) {
+            return false;
+        }
         if (bias->type != GGML_TYPE_F32 || r->type != GGML_TYPE_F32 || sink->type != GGML_TYPE_F32) {
             return false;
         }
