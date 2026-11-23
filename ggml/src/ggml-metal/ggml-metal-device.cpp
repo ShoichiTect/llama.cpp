@@ -1342,6 +1342,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     const ggml_type tsrc0 = op->src[0]->type;
     const ggml_type tsrc1 = op->src[1]->type;
 
+    char suffix_buf[32] = "";
     const char * suffix = "";
 
     bool split = false;
@@ -1511,6 +1512,37 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 nsg = N_SG_IQ4_NL;
                 nr0 = N_R0_IQ4_NL;
                 smem = 32*sizeof(float);
+
+                // every threadgroup re-reads the whole activation row, so with nr0 = 2 the loads of
+                // src1 are ~1.8x the loads of src0 and the kernel becomes load-instruction bound.
+                // 4 rows per simdgroup halves that: decode +4%, prefill is unaffected (it uses the
+                // simdgroup-matrix path). Tuning knobs kept for experiments:
+                //   GGML_METAL_MOE_NR0=2|4|8   GGML_METAL_MOE_NSG=2|4|8
+                if ((ne00 % 32) == 0) {
+                    nr0 = 4;
+                    snprintf(suffix_buf, sizeof(suffix_buf), "_nr0_4");
+                    suffix = suffix_buf;
+                }
+
+                const char * env_nr0 = getenv("GGML_METAL_MOE_NR0");
+                if (env_nr0 && (ne00 % 32) == 0) {
+                    const int nr0_env = atoi(env_nr0);
+                    if (nr0_env == 2) {
+                        nr0 = N_R0_IQ4_NL;
+                        suffix = "";
+                    } else if (nr0_env == 4 || nr0_env == 8) {
+                        nr0 = nr0_env;
+                        snprintf(suffix_buf, sizeof(suffix_buf), "_nr0_%d", nr0);
+                        suffix = suffix_buf;
+                    }
+                }
+                const char * env_nsg = getenv("GGML_METAL_MOE_NSG");
+                if (env_nsg) {
+                    const int nsg_env = atoi(env_nsg);
+                    if (nsg_env == 2 || nsg_env == 4 || nsg_env == 8) {
+                        nsg = nsg_env;
+                    }
+                }
             } break;
         case GGML_TYPE_IQ4_XS:
             {
