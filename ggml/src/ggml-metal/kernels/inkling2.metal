@@ -434,7 +434,8 @@ kernel void kernel_inkling2_mask(
     const device char * pm = mask + kv*args.nb1_m + t*args.nb2_m + s*args.nb3_m;
     const float         mv = args.src_f16 ? (float) (*(device const half *) pm) : *(device const float *) pm;
 
-    device char * pd = dst + (kv + args.n_kv*((int64_t) tok + args.n_tps*args.n_head*s))*(args.dst_f16 ? 2 : 4);
+    // [n_kv, n_tps, n_head, n_stream]: the stream stride skips all the heads, the token one does not
+    device char * pd = dst + (kv + args.n_kv*((int64_t) t + (int64_t) args.n_tps*args.n_head*s))*(args.dst_f16 ? 2 : 4);
 
     if (args.n_rel == 16 && has) {
         for (int32_t h = 0; h < args.n_head; ++h) {
