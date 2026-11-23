@@ -799,6 +799,20 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
 
 // outer wrapper: determine the ggml_type that this tensor should be quantized to
 static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_model_quantize_params * params, const ggml_tensor * tensor, ggml_type default_type, const tensor_metadata & tm) {
+    // an explicit per-tensor type wins over everything else, including a COPY (no-quantize) run
+    if (!qs.tensor_type_patterns.empty()) {
+        const std::string tensor_name(tensor->name);
+        for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+            if (std::regex_search(tensor_name, pattern)) {
+                if (qtype != tensor->type) {
+                    LLAMA_LOG_WARN("%s: %-36s - applying manual override: %s -> %s\n",
+                                   __func__, tensor_name.c_str(), ggml_type_name(tensor->type), ggml_type_name(qtype));
+                }
+                return qtype;
+            }
+        }
+    }
+
     if (!tensor_allows_quantization(params, qs.model.arch, tensor)) {
         return tensor->type;
     }
@@ -827,25 +841,8 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
 
     // get more optimal quantization type based on the tensor shape, layer, etc.
     if (ggml_is_quantized(default_type)) {
-        // if the user provided tensor types - use those
-        bool manual = false;
-        if (!qs.tensor_type_patterns.empty()) {
-            const std::string tensor_name(tensor->name);
-            for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
-                if (std::regex_search(tensor_name, pattern)) {
-                    if (qtype != new_type) {
-                        LLAMA_LOG_WARN("%s: %-36s - applying manual override: %s -> %s\n",
-                                       __func__, tensor_name.c_str(), ggml_type_name(new_type), ggml_type_name(qtype));
-                        new_type = qtype;
-                    }
-                    manual = true;
-                    break;
-                }
-            }
-        }
-
         // if not manual - use the standard logic for choosing the quantization type based on the selected mixture
-        if (!manual && !params->pure) {
+        if (!params->pure) {
             new_type = llama_tensor_get_type_impl(qs, new_type, tensor, params->ftype, tm.category);
         }
 
@@ -1204,7 +1201,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         metadata[i].allows_quantization = tensor_allows_quantization(params, model->arch, tensor);
 
-        if (metadata[i].allows_quantization) {
+        // an explicit per-tensor type can also apply to tensors a COPY run would leave alone
+        if (metadata[i].allows_quantization || !qs.tensor_type_patterns.empty()) {
             metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
         } else {
             metadata[i].target_type = tensor->type;
