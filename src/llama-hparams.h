@@ -72,6 +72,23 @@ struct llama_hparams {
     uint32_t n_embd;
     uint32_t n_layer_all;
     uint32_t n_layer_nextn = 0;
+
+    // inkling2_loop: the core [n_loop_start, n_loop_end) is re-run n_loop_passes times,
+    //   each pass after the first owns its own KV/conv slots. n_loop_passes is the maximum
+    //   the model was loaded with; a context may use fewer (see llama_cparams::n_passes).
+    uint32_t n_loop_passes = 1;
+    uint32_t n_loop_phys   = 0; // number of physical layers (0 = not a looped model)
+    uint32_t n_loop_start  = 0;
+    uint32_t n_loop_end    = 0;
+
+    // cache slots needed when the core runs `n_passes` times
+    uint32_t n_layer_use(uint32_t n_passes) const {
+        if (n_loop_phys == 0) {
+            return n_layer_all;
+        }
+        const uint32_t n = n_passes < 1 ? 1 : n_passes;
+        return n_loop_phys + (n - 1)*(n_loop_end - n_loop_start);
+    }
     uint32_t n_layer_decision = 0; // trailing blocks that form the decision head
 
     // granite-switch: index of the single-head "router" KV layer that encodes

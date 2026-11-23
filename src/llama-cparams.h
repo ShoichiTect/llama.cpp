@@ -10,6 +10,8 @@
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
+    uint32_t n_passes;        // inkling2_loop: number of passes over the looped core
+    uint32_t n_layer_use;     // number of layer/KV cache slots in use (= n_layer_all for most models)
     uint32_t n_batch;
     uint32_t n_ubatch;
     uint32_t n_seq_max;

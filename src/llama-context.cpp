@@ -196,6 +196,18 @@ llama_context::llama_context(
         cparams.n_rs_seq = 0;
     }
 
+    // inkling2_loop: the number of passes over the core can be lowered per context,
+    //   which also lowers the number of KV/conv slots the cache has to allocate
+    cparams.n_passes = hparams.n_loop_passes;
+    if (params.n_loop_passes > 0 && params.n_loop_passes < cparams.n_passes) {
+        cparams.n_passes = params.n_loop_passes;
+    }
+    if (params.n_loop_passes > hparams.n_loop_passes) {
+        LLAMA_LOG_WARN("%s: n_loop_passes=%u exceeds the model default of %u, clamping\n",
+                __func__, params.n_loop_passes, hparams.n_loop_passes);
+    }
+    cparams.n_layer_use = hparams.n_layer_use(cparams.n_passes);
+
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
@@ -444,6 +456,10 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
+    if (hparams.n_loop_phys > 0) {
+        LLAMA_LOG_INFO("%s: n_loop_passes         = %u (model default: %u)\n", __func__, cparams.n_passes, hparams.n_loop_passes);
+        LLAMA_LOG_INFO("%s: n_layer_use           = %u (model: %u)\n",         __func__, cparams.n_layer_use, hparams.n_layer_all);
+    }
     LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
     LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
 
@@ -4404,6 +4420,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
+        /*.n_loop_passes               =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default

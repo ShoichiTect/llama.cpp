@@ -15,6 +15,12 @@ void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
 
     n_phys = hparams.n_layer();
     const uint32_t block = hparams.attn_res_block_size;
+
+    // expose the loop geometry so a context can pick a smaller number of passes
+    hparams.n_loop_passes = n_passes;
+    hparams.n_loop_phys   = n_phys;
+    hparams.n_loop_start  = core_start;
+    hparams.n_loop_end    = core_end;
     // a fixed loop needs at least 2 passes, a variable loop at least 1
     if (n_passes < (varying ? 1u : 2u) || !gate_rank || !core_start || core_start >= core_end || core_end > (uint32_t) n_phys ||
         core_start % block || core_end % block || hparams.n_layer_nextn) {
@@ -82,10 +88,13 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
         cur = build_layer(il, il, cur, blocks);
     }
 
+    // the context may run fewer passes than the model was loaded with
+    const uint32_t n_passes = params.cparams.n_passes > 0 ? params.cparams.n_passes : m.n_passes;
+
     // every pass starts from the prelude output
     auto * prelude = cur;
     const auto prelude_blocks = blocks;
-    for (uint32_t pass = 0; pass < m.n_passes; ++pass) {
+    for (uint32_t pass = 0; pass < n_passes; ++pass) {
         // the bank of the previous pass: its blocks after the first core block, and its output
         std::vector<ggml_tensor *> bank;
         ggml_tensor * bank_out = nullptr;

@@ -39,7 +39,9 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                            /* number of layers to allocate the cache for (0 = hparams.n_layer_all) */
+                 uint32_t   n_layer_use = 0);
 
     ~llama_memory_hybrid() = default;
 

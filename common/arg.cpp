@@ -1630,6 +1630,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_SIZE"));
     add_opt(common_arg(
+        { "--loop-passes" }, "N",
+        "inkling2_loop: number of passes over the looped core (default: 0 = model default).\n"
+        "a lower number is faster and needs fewer KV cache slots, at the cost of quality",
+        [](common_params & params, int value) {
+            params.n_loop_passes = value;
+        }
+    ).set_env("LLAMA_ARG_LOOP_PASSES"));
+    add_opt(common_arg(
         { "--kv-unified-per-slot" }, "N",
         "context limit per parallel slot (default: unset, behavior unchanged).\n"
         "when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N",
