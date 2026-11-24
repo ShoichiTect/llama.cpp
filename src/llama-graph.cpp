@@ -18,6 +18,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <cmath>
 #include <algorithm>
 #include <array>
@@ -4531,11 +4532,27 @@ ggml_tensor * llm_graph_context::build_attn(
     const int64_t n_rows = is_swa ? n_tps : std::max<int64_t>(32, (n_tps + 31)/32);
 
     // one fused op for the whole mask when it is a plain [n_kv, t] bias: the generic path below
-    // moves ~130 MB per layer (gather, transposing copy, add, cast) at a few GB/s
+    // moves ~130 MB per layer (gather, transposing copy, add, cast) at a few GB/s, and it needs an
+    // F32 [n_head, n_kv, n_tps] intermediate, i.e. ~4x the memory of the mask it produces
+    //
+    // the mask is still materialised on purpose, and that is what limits the ubatch size at long
+    // context: n_kv*n_tps*n_head*sizeof(mask) bytes per attention layer. the fix is to hand the
+    // relative bias to the attention kernel instead of building a mask, which replaces exactly the
+    // kq_mask computed here (see the prefill notes, item P2)
+    //
+    // LLAMA_FA_MASK_FUSE_CAP_MB=<n>: force the generic path for masks larger than n MB, to
+    // reproduce the old default and to A/B both builds of the same mask in one binary. unset or
+    // <= 0 means no limit
+    static const size_t mask_fuse_cap = [] {
+        const char * e = std::getenv("LLAMA_FA_MASK_FUSE_CAP_MB");
+        const int mb = e ? atoi(e) : 0;
+        return mb > 0 ? (size_t) mb * 1024 * 1024 : (size_t) -1;
+    }();
+
     const bool can_fuse = rel_bias->op == GGML_OP_INKLING2_RELBIAS &&
         rel_bias->src[0] && rel_bias->src[1] && rel_bias->src[2] &&
         (mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32) &&
-        n_kv*n_tps*n_head*n_stream*ggml_type_size(mask->type) <= (size_t) 1024*1024*1024;
+        n_kv*n_tps*n_head*n_stream*ggml_type_size(mask->type) <= mask_fuse_cap;
 
     if (can_fuse) {
         ggml_tensor * fused = ggml_new_tensor_4d(ctx0, mask->type, n_kv, n_tps, n_head, n_stream);
