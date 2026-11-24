@@ -298,8 +298,6 @@ struct ggml_metal_kargs_inkling2_mask {
     int64_t nb2_r;
     int64_t nb1_sink;
     int64_t nb2_sink;
-    int64_t nb1_pos;
-    int64_t nb2_pos;
     int64_t nb1_m;
     int64_t nb2_m;
     int64_t nb3_m;

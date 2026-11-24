@@ -1615,9 +1615,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     if (op->op == GGML_OP_INKLING2_MASK) {
         const struct ggml_tensor * bias = op->src[0];
         const struct ggml_tensor * r    = op->src[1];
-        const struct ggml_tensor * sink = op->src[2];
-        const struct ggml_tensor * pos  = op->src[3];
-        const struct ggml_tensor * mask = op->src[4];
+        const struct ggml_tensor * sink   = op->src[2];
+        const struct ggml_tensor * kv_pos = op->src[3];
+        const struct ggml_tensor * q_pos  = op->src[4];
+        const struct ggml_tensor * mask   = op->src[5];
         if (op->ne[2] > 64) {
             return false;
         }
@@ -1627,7 +1628,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         if (bias->nb[0] != sizeof(float) || r->nb[0] != sizeof(float) || sink->nb[0] != sizeof(float)) {
             return false;
         }
-        if (pos->type != GGML_TYPE_I32 || pos->nb[0] != sizeof(int32_t)) {
+        if (kv_pos->type != GGML_TYPE_I32 || kv_pos->nb[0] != sizeof(int32_t)) {
+            return false;
+        }
+        if (q_pos->type != GGML_TYPE_I32 || q_pos->nb[0] != sizeof(int32_t)) {
             return false;
         }
         if (mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_F32) {

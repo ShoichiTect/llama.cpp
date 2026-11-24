@@ -1401,6 +1401,13 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     return res;
 }
 
+// the query positions of the ubatch, [n_batch]
+static void set_input_q_pos(ggml_tensor * dst, const llama_ubatch * ubatch) {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->ne[0] == (int64_t) ubatch->n_tokens);
+    ggml_backend_tensor_set(dst, ubatch->pos, 0, ggml_nbytes(dst));
+}
+
 void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch) {
     const auto * attn_ctx = mctx->get_attn();
 
@@ -1414,7 +1421,15 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_base()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
     }
 
-    if (self_rel_pos->buffer) {
+    if (self_kv_pos->buffer) {
+        attn_ctx->get_base()->set_input_kv_pos(self_kv_pos, ubatch);
+    }
+
+    if (self_q_pos->buffer) {
+        set_input_q_pos(self_q_pos, ubatch);
+    }
+
+    if (self_rel_pos && self_rel_pos->buffer) {
         attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
     }
 
@@ -1428,7 +1443,15 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
     }
 
-    if (self_rel_pos_swa->buffer) {
+    if (self_kv_pos_swa->buffer) {
+        attn_ctx->get_swa()->set_input_kv_pos(self_kv_pos_swa, ubatch);
+    }
+
+    if (self_q_pos_swa->buffer) {
+        set_input_q_pos(self_q_pos_swa, ubatch);
+    }
+
+    if (self_rel_pos_swa && self_rel_pos_swa->buffer) {
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
     }
 
@@ -1469,8 +1492,10 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= can_reuse_kq_mask(inp_attn->self_attn_mask.raw, attn_ctx->get_base(), params.ubatch, params.cparams);
 
-    res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
-    res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
+    res &= self_kv_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
+    res &= self_q_pos->ne[0] == params.ubatch.n_tokens;
+    res &= self_rel_pos == nullptr || (self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv() &&
+                                       self_rel_pos->ne[1] == params.ubatch.n_tokens);
 
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
@@ -1479,8 +1504,10 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= can_reuse_kq_mask(inp_attn->self_attn_mask_swa.raw, attn_ctx->get_swa(), params.ubatch, params.cparams);
 
-    res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
-    res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+    res &= self_kv_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+    res &= self_q_pos_swa->ne[0] == params.ubatch.n_tokens;
+    res &= self_rel_pos_swa == nullptr || (self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv() &&
+                                           self_rel_pos_swa->ne[1] == params.ubatch.n_tokens);
 
     res &= self_rows->ne[0] == params.ubatch.n_tokens;
 
@@ -4478,13 +4505,36 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa_rel>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);
 
-    inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
-    ggml_set_input(inp->self_rel_pos);
-    ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
+    // the masks may not be allocated (all layers SWA), so take the stream count from the ubatch,
+    // see build_attn_inp_kq_mask()
+    const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
-    inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), ubatch.n_tokens);
-    ggml_set_input(inp->self_rel_pos_swa);
-    ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
+    inp->self_kv_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), n_stream);
+    ggml_set_input(inp->self_kv_pos);
+    ggml_set_name(inp->self_kv_pos, "attn_inp_kv_pos");
+
+    inp->self_kv_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), n_stream);
+    ggml_set_input(inp->self_kv_pos_swa);
+    ggml_set_name(inp->self_kv_pos_swa, "attn_inp_kv_pos_swa");
+
+    inp->self_q_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+    ggml_set_input(inp->self_q_pos);
+    ggml_set_name(inp->self_q_pos, "attn_inp_q_pos");
+
+    inp->self_q_pos_swa = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+    ggml_set_input(inp->self_q_pos_swa);
+    ggml_set_name(inp->self_q_pos_swa, "attn_inp_q_pos_swa");
+
+    // the distance tensor is only needed by the generic mask path, which is an A/B tool
+    if (getenv("LLAMA_FA_MASK_FUSE_CAP_MB")) {
+        inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
+        ggml_set_input(inp->self_rel_pos);
+        ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
+
+        inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), ubatch.n_tokens);
+        ggml_set_input(inp->self_rel_pos_swa);
+        ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
+    }
 
     inp->self_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
     ggml_set_input(inp->self_rows);
@@ -4516,7 +4566,9 @@ ggml_tensor * llm_graph_context::build_attn(
     GGML_ASSERT(attn_mask.rows == nullptr);
 
     ggml_tensor * mask    = attn_mask.raw;                                         // [n_kv, n_tps, 1, n_stream]
-    ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos; // [n_kv, n_tokens]
+    ggml_tensor * kv_pos  = is_swa ? inp->self_kv_pos_swa : inp->self_kv_pos;      // i32 [n_kv, n_stream]
+    ggml_tensor * q_pos   = is_swa ? inp->self_q_pos_swa  : inp->self_q_pos;       // i32 [n_tokens]
+    ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;    // [n_kv, n_tokens], generic path only
 
     const int64_t n_kv     = mask->ne[0];
     const int64_t n_tps    = mask->ne[1];
@@ -4560,11 +4612,13 @@ ggml_tensor * llm_graph_context::build_attn(
         fused->src[0] = rel_bias->src[0]; // [n_rel, n_bucket], the pad bucket is a zero row
         fused->src[1] = rel_bias->src[1]; // [n_rel, n_head, n_tokens]
         fused->src[2] = rel_bias->src[2]; // [1, n_head, n_tokens]
-        fused->src[3] = rel_pos;          // i32 [n_kv, n_tps, n_stream]
-        fused->src[4] = mask;             // base mask, broadcast over the heads
+        fused->src[3] = kv_pos;           // i32 [n_kv, n_stream], -1 for the empty cells
+        fused->src[4] = q_pos;            // i32 [n_tokens], the streams are contiguous
+        fused->src[5] = mask;             // base mask, broadcast over the heads
 
         kq_mask = fused;
     } else if (n_rows >= n_tps) {
+        GGML_ASSERT(rel_pos != nullptr && "the generic mask path needs LLAMA_FA_MASK_FUSE_CAP_MB");
         // [n_head, n_kv, n_tokens] -> [n_kv, n_tps, n_head, n_stream]
         ggml_tensor * kq_b = ggml_get_rows(ctx0, rel_bias, rel_pos);
         kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tps, n_stream);
@@ -4575,6 +4629,7 @@ ggml_tensor * llm_graph_context::build_attn(
             kq_mask = ggml_cast(ctx0, kq_mask, mask->type);
         }
     } else {
+        GGML_ASSERT(rel_pos != nullptr && "the generic mask path needs LLAMA_FA_MASK_FUSE_CAP_MB");
         // the scheduler copies each view of an input to the device on its own, copy the whole input once instead
         rel_pos = ggml_cont(ctx0, rel_pos);
 

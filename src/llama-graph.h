@@ -804,7 +804,16 @@ public:
     llm_graph_input_attn_kv_iswa * get_attn() const { return inp_attn.get(); }
     llm_graph_input_rs           * get_recr() const { return inp_rs.get(); }
 
-    // distance from the token to the cell, extent for the empty, future and more distant cells
+    // the position of each K/V cell (-1 when empty) and of each query token: the fused KQ mask op
+    // derives the distance bucket as clamp(q_pos[t] - kv_pos[kv], 0, extent), which is exactly what
+    // the [n_kv, n_batch] distance tensor below holds, without the O(n_kv*n_tokens) host loop
+    ggml_tensor * self_kv_pos     = nullptr; // I32 [n_kv,     n_stream]
+    ggml_tensor * self_q_pos      = nullptr; // I32 [n_batch]
+    ggml_tensor * self_kv_pos_swa = nullptr; // I32 [n_kv_swa, n_stream]
+    ggml_tensor * self_q_pos_swa  = nullptr; // I32 [n_batch]
+
+    // distance from the token to the cell, extent for the empty, future and more distant cells.
+    // only allocated for the generic (non-fused) mask path, see LLAMA_FA_MASK_FUSE_CAP_MB
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 

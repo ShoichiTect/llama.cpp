@@ -1430,8 +1430,9 @@ int ggml_metal_op_inkling2_mask(ggml_metal_op_t ctx, int idx) {
     const ggml_tensor * bias = op->src[0]; // [n_rel, n_bucket]
     const ggml_tensor * r    = op->src[1]; // [n_rel, n_head, n_tokens]
     const ggml_tensor * sink = op->src[2]; // [1, n_head, n_tokens]
-    const ggml_tensor * pos  = op->src[3]; // i32 [n_kv, n_tps*n_stream]
-    const ggml_tensor * mask = op->src[4]; // [n_kv, n_tps, 1, n_stream]
+    const ggml_tensor * kv_pos = op->src[3]; // i32 [n_kv,     n_stream], -1 for the empty cells
+    const ggml_tensor * q_pos  = op->src[4]; // i32 [n_tokens]
+    const ggml_tensor * mask   = op->src[5]; // [n_kv, n_tps, 1, n_stream]
 
     const int32_t nth_kv = 64;
 
@@ -1450,8 +1451,6 @@ int ggml_metal_op_inkling2_mask(ggml_metal_op_t ctx, int idx) {
         /*.nb2_r    =*/ (int64_t) r->nb[2],
         /*.nb1_sink =*/ (int64_t) sink->nb[1],
         /*.nb2_sink =*/ (int64_t) sink->nb[2],
-        /*.nb1_pos  =*/ (int64_t) pos->nb[0],
-        /*.nb2_pos  =*/ (int64_t) pos->nb[1],
         /*.nb1_m    =*/ (int64_t) mask->nb[0],
         /*.nb2_m    =*/ (int64_t) mask->nb[1],
         /*.nb3_m    =*/ (int64_t) mask->nb[3],
@@ -1469,10 +1468,11 @@ int ggml_metal_op_inkling2_mask(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(bias), 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(r),    2);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sink), 3);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(pos),  4);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mask), 5);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),   6);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sink),   3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(kv_pos), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q_pos),  5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mask),   6);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),     7);
 
     ggml_metal_encoder_dispatch_threadgroups(enc,
             (int) ((op->ne[0] + nth_kv - 1)/nth_kv), (int) (op->ne[1]*op->ne[3]), 1,

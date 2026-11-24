@@ -395,7 +395,8 @@ kernel void kernel_inkling2_mask(
         device const char * bias,
         device const char * r,
         device const char * sink,
-        device const char * pos,
+        device const int  * kv_pos,
+        device const int  * q_pos,
         device const char * mask,
         device       char * dst,
         uint3  tgpig [[threadgroup_position_in_grid]],
@@ -436,7 +437,14 @@ kernel void kernel_inkling2_mask(
 
     // the bias row of this bucket (16 channels, one 64B row) and the base mask value are used for
     // every head, so they are loaded once per (kv, t)
-    const int32_t b   = *(device const int *) (pos + kv*args.nb1_pos + tok*args.nb2_pos);
+    //
+    // the distance bucket comes from the two small position tensors instead of an [n_kv, n_tokens]
+    // tensor: filling that one was O(n_kv*n_tokens) on the host and 4 B/(ctx * n_tps) of memory,
+    // this is one subtraction. an empty cell (-1) and a future cell (d < 0) both map to the pad
+    // bucket, which is the implicit zero row past the end of the bias table
+    const int32_t kp  = kv_pos[kv + args.n_kv*s];
+    const int32_t d   = q_pos[tok] - kp;
+    const int32_t b   = (kp < 0 || d < 0 || d >= args.n_ext) ? args.n_ext : d;
     const bool    has = b < args.n_ext;
 
     float4 br[4] = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
