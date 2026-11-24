@@ -5520,6 +5520,32 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
+void ggml_flash_attn_ext_set_rel_bias(
+        struct ggml_tensor * a,
+        struct ggml_tensor * rel_bias,
+        struct ggml_tensor * kv_pos,
+        struct ggml_tensor * q_pos) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    if (!rel_bias) {
+        a->src[6] = NULL;
+        a->src[7] = NULL;
+        a->src[8] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(rel_bias->type == GGML_TYPE_F32 && "rel_bias must be f32");
+    GGML_ASSERT(kv_pos->type   == GGML_TYPE_I32 && "kv_pos must be i32");
+    GGML_ASSERT(q_pos->type    == GGML_TYPE_I32 && "q_pos must be i32");
+
+    GGML_ASSERT(rel_bias->ne[0] == a->src[0]->ne[2] && "rel_bias must have one row per head");
+    GGML_ASSERT(a->src[5] == NULL && "rel_bias and kv_rows are mutually exclusive");
+
+    a->src[6] = rel_bias;
+    a->src[7] = kv_pos;
+    a->src[8] = q_pos;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

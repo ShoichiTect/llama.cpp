@@ -106,7 +106,11 @@
 #define FC_FLASH_ATTN_EXT_PAD          100
 #define FC_FLASH_ATTN_EXT_BLK          200
 #define FC_FLASH_ATTN_EXT              300
+// the relative distance bias replaces the materialised per-head mask (inkling2), see
+// ggml_flash_attn_ext_set_rel_bias()
+#define FC_FLASH_ATTN_EXT_REL_BIAS     (FC_FLASH_ATTN_EXT + 5)
 #define FC_FLASH_ATTN_EXT_VEC          400
+#define FC_FLASH_ATTN_EXT_VEC_REL_BIAS (FC_FLASH_ATTN_EXT_VEC + 7)
 #define FC_FLASH_ATTN_EXT_VEC_REDUCE   500
 #define FC_MUL_MV                      600
 #define FC_MUL_MM                      700
@@ -589,6 +593,11 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    // relative distance bias: the bias is zero at and beyond rel_ext (the pad bucket)
+    int32_t  rel_ext;
+    int32_t  n_kv_pos;   // rows of kv_pos, the same row count as the mask
+    uint64_t nb1_bias;   // bucket stride of rel_bias
+    uint64_t nb2_bias;   // token stride of rel_bias
 } ggml_metal_kargs_flash_attn_ext;
 
 typedef struct {
@@ -625,6 +634,11 @@ typedef struct {
     int32_t  n_head_log2;
     float    logit_softcap;
     int32_t  n_kv_max_padded;
+    // relative distance bias, see ggml_metal_kargs_flash_attn_ext
+    int32_t  rel_ext;
+    int32_t  n_kv_pos;
+    uint64_t nb1_bias;
+    uint64_t nb2_bias;
 } ggml_metal_kargs_flash_attn_ext_vec;
 
 typedef struct {

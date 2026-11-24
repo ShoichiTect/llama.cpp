@@ -1891,6 +1891,28 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ROLL:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_FLASH_ATTN_EXT:
+            // the relative distance bias (ggml_flash_attn_ext_set_rel_bias) is added inside the
+            // dense kernels: it needs a mask to add the bias to, and it does not combine with the
+            // K/V row lists or with the sparse path
+            if (op->src[6] != NULL) {
+                const struct ggml_tensor * rel_bias = op->src[6];
+                const struct ggml_tensor * kv_pos   = op->src[7];
+                const struct ggml_tensor * q_pos    = op->src[8];
+
+                if (!rel_bias || !kv_pos || !q_pos) {
+                    return false;
+                }
+                if (rel_bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(rel_bias) ||
+                    rel_bias->ne[0] != op->src[0]->ne[2] || rel_bias->ne[1] < 2 ||
+                    kv_pos->type != GGML_TYPE_I32 || kv_pos->nb[0] != sizeof(int32_t) ||
+                    q_pos->type != GGML_TYPE_I32 || q_pos->nb[0] != sizeof(int32_t)) {
+                    return false;
+                }
+                if (op->src[3] == NULL || op->src[5] != NULL) {
+                    return false;
+                }
+            }
+
             // K/V row lists (ggml_flash_attn_ext_rows): one list of cache rows per q slice
             if (op->src[5] != NULL) {
                 const struct ggml_tensor * kv_rows = op->src[5];

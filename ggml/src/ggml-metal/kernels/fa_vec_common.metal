@@ -14,6 +14,9 @@ constant int32_t FC_flash_attn_ext_vec_nsg  [[function_constant(FC_FLASH_ATTN_EX
 constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 23)]];
 constant bool    FC_flash_attn_ext_vec_has_sparse [[function_constant(FC_FLASH_ATTN_EXT_VEC + 5)]];
 constant bool    FC_flash_attn_ext_vec_has_rows   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 6)]];
+
+// inkling2: add the relative distance bias inside the kernel instead of materialising a per-head mask
+constant bool    FC_flash_attn_ext_vec_rel_bias   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 7)]];
 template<
     typename q4_t,  // query types in shared memory
     typename k4_t,  // key types in shared memory
@@ -42,6 +45,9 @@ kernel void kernel_flash_attn_ext_vec(
         device const char * mask,
         device const char * sinks,
         device const char * pad,
+        device const char * rel_bias,
+        device const char * kv_pos,
+        device const char * q_pos,
         device       char * dst,
         device const char * idx,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
@@ -257,6 +263,43 @@ kernel void kernel_flash_attn_ext_vec(
                     FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
                         if ((iq1*Q + qq) < args.ne01) {
                             sm[qq*C + tiisg] = pm[qq][ic + tiisg];
+                        } else {
+                            sm[qq*C + tiisg] = -MAXHALF;
+                        }
+                    }
+                } else if (FC_flash_attn_ext_vec_rel_bias) {
+                    // the per-head mask is not materialised: fold the bias of the distance to this cell
+                    // into the mask value here, so that the scoring below and the -INF skip work
+                    // unchanged. the table already holds -sink and its last bucket is the value of the
+                    // cells that are empty, in the future or farther than the extent, so nothing else
+                    // is added. the sum is rounded to f16 once, exactly as the mask op did
+                    const device int   * kvpos = (device const int   *) kv_pos;
+                    const device int   * qpos  = (device const int   *) q_pos;
+
+                    const int64_t kv0 = (int64_t) ic0*C;
+
+                    FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                        const int32_t tok = (iq1*Q + qq) + args.ne31*(iq3%args.ne33);
+
+                        if ((iq1*Q + qq) < args.ne01) {
+                            const int32_t qp = qpos[tok];
+
+                            // iq2 is the query head (ne02), not the mask row: the mask is broadcast over heads
+                            // the bucket stride is in bytes, so index from a char pointer
+                            const device char * ptok = rel_bias + (int64_t) iq2*4 + (int64_t) tok*args.nb2_bias;
+
+                            const int64_t kv = kv0 + tiisg;
+
+                            int32_t b = args.rel_ext;
+                            if (kv < args.n_kv_pos) {
+                                const int32_t kp = kvpos[kv + (int64_t) args.n_kv_pos*(iq3%args.ne33)];
+                                const int32_t d  = qp - kp;
+                                if (kp >= 0 && d >= 0 && d < args.rel_ext) {
+                                    b = d;
+                                }
+                            }
+
+                            sm[qq*C + tiisg] = (half) (*(device const float *) (ptok + (int64_t) b*args.nb1_bias) + (float) pm[qq][ic + tiisg]);
                         } else {
                             sm[qq*C + tiisg] = -MAXHALF;
                         }

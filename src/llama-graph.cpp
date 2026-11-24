@@ -3219,7 +3219,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+    const llm_attn_rel_bias * kq_rel_bias) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -3264,6 +3265,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
+
+        if (kq_rel_bias) {
+            // the bias of the distance to each cell is added by the attention kernel, together with
+            // the base mask in kq_mask and the per-query sink
+            GGML_ASSERT(kv_rows == nullptr && "Flash attention does not support the relative bias with kv_rows");
+            ggml_flash_attn_ext_set_rel_bias(cur, kq_rel_bias->table, kq_rel_bias->kv_pos, kq_rel_bias->q_pos);
+        }
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);
@@ -3818,7 +3826,8 @@ static ggml_tensor * build_attn_iswa_impl(
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
             float     kq_scale,
-            int       il) {
+            int       il,
+        const llm_attn_rel_bias * kq_rel_bias = nullptr) {
     ggml_context * ctx0 = gctx.ctx0;
     ggml_cgraph  * gf   = gctx.gf;
 
@@ -3884,7 +3893,7 @@ static ggml_tensor * build_attn_iswa_impl(
     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il, kq_rel_bias);
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     gctx.cb(cur, "kqv_out", il);
 
@@ -4575,6 +4584,25 @@ ggml_tensor * llm_graph_context::build_attn(
     const int64_t n_stream = mask->ne[3];
     const int64_t n_head   = rel_bias->ne[0];
     const int64_t n_bucket = rel_bias->ne[1];
+
+    // P2b: hand the relative bias to the attention kernel instead of materialising a per-head mask.
+    // the kernel computes mask[kv,t,h] = rel_bias[h, clamp(q_pos[t] - kv_pos[kv], 0, extent), t] - sink[h,t]
+    // and adds the base mask, so the n_kv*n_tps*n_head mask and its blk scan (n_head times the mask
+    // read per layer) are both gone. LLAMA_INKLING2_FA_RELBIAS=<0|1> selects it for A/B
+    static const bool use_fa_rel_bias = [] {
+        const char * e = std::getenv("LLAMA_INKLING2_FA_RELBIAS");
+        return e && atoi(e) != 0;
+    }();
+
+    if (use_fa_rel_bias &&
+        cparams.flash_attn &&
+        rel_bias->op == GGML_OP_INKLING2_RELBIAS && rel_bias->src[0] && rel_bias->src[1] && rel_bias->src[2] &&
+        mask->type == GGML_TYPE_F16) {
+        const llm_attn_rel_bias rb = { rel_bias, kv_pos, q_pos };
+
+        return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur,
+                nullptr, mask, nullptr, sinks, nullptr, kq_scale, il, &rb);
+    }
 
     // a mask per head, in the dense layout of the input mask and of its type (F16 for flash attention)
     ggml_tensor * kq_mask = nullptr;

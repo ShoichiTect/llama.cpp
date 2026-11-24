@@ -4,6 +4,9 @@ constant bool FC_flash_attn_ext_has_bias  [[function_constant(FC_FLASH_ATTN_EXT 
 constant bool FC_flash_attn_ext_has_scap  [[function_constant(FC_FLASH_ATTN_EXT + 3)]];
 constant bool FC_flash_attn_ext_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT + 4)]];
 
+// inkling2: add the relative distance bias inside the kernel instead of materialising a per-head mask
+constant bool FC_flash_attn_ext_rel_bias [[function_constant(FC_FLASH_ATTN_EXT + 5)]];
+
 constant bool FC_flash_attn_ext_bc_mask [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
 
 //constant float FC_flash_attn_ext_scale         [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
@@ -53,6 +56,9 @@ void kernel_flash_attn_ext_impl(
         device const char * sinks,
         device const char * pad,
         device const char * blk,
+        device const char * rel_bias,
+        device const char * kv_pos,
+        device const char * q_pos,
         device       char * dst,
         threadgroup  half * shmem_f16,
         uint3   tgpig,
@@ -111,6 +117,11 @@ void kernel_flash_attn_ext_impl(
 
     // per-query mask pointers
     device const half2 * pm2[NQ];
+
+    const int32_t ih3 = iq3%args.ne33; // the stream of this threadgroup
+
+    const device int   * kvpos = (device const int   *) kv_pos;
+    const device int   * qpos  = (device const int   *) q_pos;
 
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
         const short j = jj*NSG + sgitg;
@@ -422,7 +433,52 @@ void kernel_flash_attn_ext_impl(
                 }
 
                 // mqk = mqk + slope*mask
-                if (blk_cur != 2) {
+                if (FC_flash_attn_ext_rel_bias) {
+                    // the per-head mask is not materialised: the base mask plus the bias of the distance
+                    // from the query to each cell. the bias table already holds -sink, and its last
+                    // bucket holds the value for the cells that are empty, in the future or farther
+                    // than the extent, so there is nothing else to add. the sum is rounded to f16 once
+                    // exactly as the mask op did, so the two paths are bit-identical
+                    const int32_t tok = (iq1 + j) + args.ne31*ih3;
+                    const int32_t qp  = qpos[tok];
+
+                    // the bucket stride is in bytes, so index from a char pointer
+                    const device char * ptok = rel_bias + (int64_t) iq2*4 + (int64_t) tok*args.nb2_bias;
+
+                    const float2 s2b = blk_cur != 2 ? s2_t(sm2[j*SH + tiisg]) : float2(0.0f);
+
+                    // the cells are ordered by position, so the last one is the nearest to the query:
+                    // when even that one is farther than the extent, every cell of the chunk gets the
+                    // pad bucket and the bias is a single value for the whole chunk
+                    const int64_t kv0  = (int64_t) ic0*C;
+                    const int64_t kvl  = min(kv0 + C - 1, (int64_t) args.n_kv_pos - 1);
+                    const int32_t kpl  = kvpos[kvl + (int64_t) args.n_kv_pos*ih3];
+
+                    if (kpl >= 0 && qp - kpl >= args.rel_ext) {
+                        s2 += float2(half2(s2b + *(device const float *) (ptok + (int64_t) args.rel_ext*args.nb1_bias)));
+                    } else {
+                        float2 bs = float2(0.0f);
+                        FOR_UNROLL (short ii = 0; ii < 2; ++ii) {
+                            const int64_t kv = kv0 + 2*tiisg + ii;
+                            int32_t b = args.rel_ext;
+                            if (kv < args.n_kv_pos) {
+                                const int32_t kp = kvpos[kv + (int64_t) args.n_kv_pos*ih3];
+                                const int32_t d  = qp - kp;
+                                if (kp >= 0 && d >= 0 && d < args.rel_ext) {
+                                    b = d;
+                                }
+                            }
+
+                            const float bv = *(device const float *) (ptok + (int64_t) b*args.nb1_bias);
+                            if (ii == 0) {
+                                bs.x = bv;
+                            } else {
+                                bs.y = bv;
+                            }
+                        }
+                        s2 += float2(half2(bs + s2b));
+                    }
+                } else if (blk_cur != 2) {
                     if (FC_flash_attn_ext_has_bias) {
                         s2 += s2_t(sm2[j*SH + tiisg])*slope;
                     } else {
@@ -691,13 +747,16 @@ kernel void kernel_flash_attn_ext(
         device const char * sinks,
         device const char * pad,
         device const char * blk,
+        device const char * rel_bias,
+        device const char * kv_pos,
+        device const char * q_pos,
         device       char * dst,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
 #define FWD_TMPL q_t, q4_t, q8x8_t, k_t, k4x4_t, k8x8_t, v_t, v4x4_t, v8x8_t, qk_t, qk8x8_t, s_t, s2_t, s8x8_t, o_t, o4_t, o8x8_t, kd4x4_t, nl_k, deq_k, vd4x4_t, nl_v, deq_v, DK, DV, Q, C
-#define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg
+#define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, rel_bias, kv_pos, q_pos, dst, shmem_f16, tgpig, tiisg, sgitg
     switch (FC_flash_attn_ext_nsg) {
       // note: disabled cases to reduce library load time
       //case 1: kernel_flash_attn_ext_impl<FWD_TMPL, 1>(FWD_ARGS); break;

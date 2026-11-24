@@ -2289,6 +2289,19 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // a per-head bias of the relative distance between the query and the K/V cell, added inside the
+    // attention kernel instead of materialising a [n_kv, n_tokens, n_head] mask:
+    //     mask[kv, t, h] = rel_bias[h, clamp(q_pos[t] - kv_pos[kv], 0, n_bucket - 1), t] + kq_mask[kv, t]
+    // rel_bias is f32 [n_head, n_bucket, n_tokens] where the last bucket holds the bias of the cells
+    // that are empty, in the future or farther than the extent; kv_pos is i32 [n_kv, n_stream] with
+    // -1 for an empty cell and q_pos is i32 [n_tokens]. the bias is used exactly like a mask value,
+    // so the kernel rounds the sum to the mask type before adding it to the scores.
+    GGML_API void ggml_flash_attn_ext_set_rel_bias(
+            struct ggml_tensor * a,
+            struct ggml_tensor * rel_bias,
+            struct ggml_tensor * kv_pos,
+            struct ggml_tensor * q_pos);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

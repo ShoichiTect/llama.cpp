@@ -101,6 +101,14 @@ struct llama_cross {
 
 struct llm_graph_params;
 
+// the per-head bias of the relative distance between a query and a K/V cell, applied inside the
+// attention kernel instead of materialising a [n_kv, n_tokens, n_head] mask
+struct llm_attn_rel_bias {
+    ggml_tensor * table;  // f32 [n_head, n_bucket, n_tokens], the last bucket holds the sink and the pad
+    ggml_tensor * kv_pos; // i32 [n_kv, n_stream], -1 for an empty cell
+    ggml_tensor * q_pos;  // i32 [n_tokens]
+};
+
 //
 // llm_graph_input
 //
@@ -1355,7 +1363,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+    const llm_attn_rel_bias * kq_rel_bias = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

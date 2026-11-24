@@ -429,6 +429,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    // the relative distance bias of the attention is only implemented by the Metal backend;
+    // falling back to the CPU here would compute the attention without it
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[6] != NULL) {
+        return false;
+    }
+
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {
