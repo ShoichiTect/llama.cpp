@@ -2165,12 +2165,14 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+        const int64_t t_trace = ggml_backend_sched_trace_begin();
         ggml_backend_synchronize(input_backend);
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
         } else {
             ggml_backend_synchronize(split_backend);
         }
+        ggml_backend_sched_trace_end("sync-copy", input, split_backend, t_trace);
         ggml_backend_tensor_copy(input, input_cpy);
     }
 }
