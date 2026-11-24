@@ -4535,7 +4535,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool can_fuse = rel_bias->op == GGML_OP_INKLING2_RELBIAS &&
         rel_bias->src[0] && rel_bias->src[1] && rel_bias->src[2] &&
         (mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32) &&
-        n_kv*n_tps*n_head*n_stream*ggml_type_size(mask->type) <= (size_t) 256*1024*1024;
+        n_kv*n_tps*n_head*n_stream*ggml_type_size(mask->type) <= (size_t) 1024*1024*1024;
 
     if (can_fuse) {
         ggml_tensor * fused = ggml_new_tensor_4d(ctx0, mask->type, n_kv, n_tps, n_head, n_stream);
