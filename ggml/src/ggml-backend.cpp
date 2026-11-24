@@ -2097,6 +2097,28 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
+// debug: log the split inputs whose copy forces a synchronisation, and how long that wait took.
+// GGML_SCHED_TRACE_INPUT=1 enables it. used to find what makes multi-sequence decode stall.
+static bool ggml_backend_sched_trace_enabled(void) {
+    static const bool enabled = getenv("GGML_SCHED_TRACE_INPUT") != NULL;
+    return enabled;
+}
+
+static int64_t ggml_backend_sched_trace_begin(void) {
+    return ggml_backend_sched_trace_enabled() ? ggml_time_us() : -1;
+}
+
+static void ggml_backend_sched_trace_end(const char * kind, const struct ggml_tensor * input,
+                                         ggml_backend_t backend, int64_t t_begin) {
+    if (t_begin < 0) {
+        return;
+    }
+
+    GGML_LOG_INFO("[sched-trace] %-11s %-30s %8.2f MiB  wait %9.3f ms  backend=%s\n",
+            kind, input->name, (double) ggml_nbytes(input) / (1024.0*1024.0),
+            (ggml_time_us() - t_begin) / 1000.0, ggml_backend_name(backend));
+}
+
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -2115,21 +2137,25 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
 
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+        const int64_t t_trace = ggml_backend_sched_trace_begin();
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
         } else {
             ggml_backend_synchronize(split_backend);
         }
+        ggml_backend_sched_trace_end("user-input", input, split_backend, t_trace);
         ggml_backend_tensor_copy(input, input_cpy);
         return;
     }
 
     // wait for the split backend to finish using the input before overwriting it
+    const int64_t t_trace = ggml_backend_sched_trace_begin();
     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
     } else {
         ggml_backend_synchronize(split_backend);
     }
+    ggml_backend_sched_trace_end("split-input", input, split_backend, t_trace);
 
     if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
