@@ -284,21 +284,35 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     memcpy(out->op_params + 4, &hist_off,   sizeof(int32_t));
     ggml_set_name(out, "inkling2_conv");
 
-    // before the state store, so that the convolution still reads the old history
-    ggml_build_forward_expand(gf, out);
-
     if (cparams.n_rs_seq == 0) {
         const size_t cell_offs = inp->mctx->get_head()*state->nb[1] + offset*(n_conv - 1)*ggml_element_size(state);
 
         ggml_tensor * cell = ggml_view_2d(ctx0, state, (n_conv - 1)*n_channels, n_seqs, state->nb[1], cell_offs);
-        cell->op     = GGML_OP_INKLING2_CONV_STATE;
-        cell->src[0] = cur;
-        cell->src[1] = history;
-        memcpy(cell->op_params, &hist_off, sizeof(int32_t));
         ggml_set_name(cell, "inkling2_conv_state");
 
-        ggml_build_forward_expand(gf, cell);
+        if (n_seq_tokens == 1 && !inkling2_ablate("nofuseconv")) {
+            // decode: the same kernel stores the state after it has read the history, which saves a
+            // dispatch. thread (ch, s) is the only one touching its own state row, so the in-place
+            // update is safe. prefills keep the separate node (several threads share one history row)
+            const int32_t has_state = 1;
+            out->src[4] = cell;
+            memcpy(out->op_params + 5, &has_state, sizeof(int32_t));
+            ggml_build_forward_expand(gf, out);
+        } else {
+            // before the state store, so that the convolution still reads the old history
+            ggml_build_forward_expand(gf, out);
+
+            cell->op     = GGML_OP_INKLING2_CONV_STATE;
+            cell->src[0] = cur;
+            cell->src[1] = history;
+            memcpy(cell->op_params, &hist_off, sizeof(int32_t));
+
+            ggml_build_forward_expand(gf, cell);
+        }
     } else {
+        // before the state store, so that the convolution still reads the old history
+        ggml_build_forward_expand(gf, out);
+
         // the rollback path needs the padded buffer anyway
         ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
         ggml_tensor * x = ggml_concat(ctx0, past, ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs)), 0);

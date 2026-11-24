@@ -1541,6 +1541,7 @@ int ggml_metal_op_inkling2_conv(ggml_metal_op_t ctx, int idx) {
     const ggml_tensor * w    = op->src[1];
     const ggml_tensor * hist = op->src[2];
     const ggml_tensor * dyn  = op->src[3];
+    const ggml_tensor * cell = op->src[4];
 
     const int32_t n_conv     = (int32_t) w->ne[0];
     const int32_t n_cols     = n_conv - 1;
@@ -1553,8 +1554,10 @@ int ggml_metal_op_inkling2_conv(ggml_metal_op_t ctx, int idx) {
 
     float   scale    = 1.0f;
     int32_t hist_off = 0;
+    int32_t has_state = 0;
     memcpy(&scale,    op->op_params,     sizeof(float));
     memcpy(&hist_off, op->op_params + 4, sizeof(int32_t));
+    memcpy(&has_state, op->op_params + 5, sizeof(int32_t));
 
     ggml_metal_kargs_inkling2_conv args = {
         /*.n_conv       =*/ n_conv,
@@ -1566,9 +1569,11 @@ int ggml_metal_op_inkling2_conv(ggml_metal_op_t ctx, int idx) {
         /*.hsz          =*/ hsz,
         /*.has_dyn      =*/ dyn ? 1 : 0,
         /*.hist_off     =*/ hist_off,
+        /*.has_state    =*/ has_state && cell ? 1 : 0,
         /*.scale        =*/ scale,
         /*.nb1_h        =*/ (int64_t) hist->nb[1],
         /*.nb2_h        =*/ (int64_t) hist->nb[2],
+        /*.nb1_cell     =*/ cell ? (int64_t) cell->nb[1] : 0,
     };
 
     char base[256];
@@ -1589,6 +1594,7 @@ int ggml_metal_op_inkling2_conv(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(hist), 3);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dyn ? dyn : cur), 4);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),   5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cell ? cell : op), 6);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, (nt + nth - 1)/nth, 1, 1, nth, 1, 1);
 

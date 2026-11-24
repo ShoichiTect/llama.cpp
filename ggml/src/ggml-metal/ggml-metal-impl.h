@@ -333,9 +333,11 @@ struct ggml_metal_kargs_inkling2_conv {
     int32_t hsz;
     int32_t has_dyn;
     int32_t hist_off;
+    int32_t has_state;
     float   scale;
     int64_t nb1_h;
     int64_t nb2_h;
+    int64_t nb1_cell;
 };
 
 // the recurrent state cell: the last n_cols rows of the padded buffer, stored as [lag, channel]

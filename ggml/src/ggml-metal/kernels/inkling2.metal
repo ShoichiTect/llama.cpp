@@ -33,6 +33,10 @@ kernel void kernel_inkling2_clip(
 // the short convolution: out[ch,t] = (cur[ch,t] + sum_lag x[t+lag,ch]*w[ch,lag]
 //   + sum_lag x[t+(n_cols-lag),ch]*dyn[lag,head(ch),t]) * scale
 // where the padded row k is hist[k] for k < n_cols and cur[k - n_cols] after that
+//
+// has_state != 0 のときは、同じカーネルで recurrent state の更新も行う(n_seq_tokens == 1 の decode 専用)。
+// この場合 thread (ch, s) は自分の (ch, s) の hist 行しか読まず、書き込みも同じ行だけなので、
+// 読み終わってから書くというプログラム順序だけで安全になる(dispatch が 1 回減る)。
 kernel void kernel_inkling2_conv(
         constant ggml_metal_kargs_inkling2_conv & args,
         device const float * cur,
@@ -40,6 +44,7 @@ kernel void kernel_inkling2_conv(
         device const float * hist,
         device const float * dyn,
         device       float * out,
+        device       float * cell,
         uint gid [[thread_position_in_grid]]) {
     const int64_t nc = (int64_t) args.n_channels*args.n_tokens;
     if ((int64_t) gid >= nc) {
@@ -76,6 +81,18 @@ kernel void kernel_inkling2_conv(
     }
 
     out[ch + (int64_t) args.n_channels*t] = (cur[ch + (int64_t) args.n_channels*t] + acc)*args.scale;
+
+    if (args.has_state) {
+        // the last n_cols rows of the padded buffer; everything here was already read above by
+        // this same thread, so the in-place update does not race with the convolution
+        device float * cp = (device float *) ((device char *) cell + (int64_t) s*args.nb1_cell) + (int64_t) ch*args.n_cols;
+        for (int l = 0; l < args.n_cols; ++l) {
+            const int k = args.n_seq_tokens + l;
+            cp[l] = k < args.n_cols
+                ? hc[k]
+                : cur[ch + (int64_t) args.n_channels*(s*args.n_seq_tokens + (k - args.n_cols))];
+        }
+    }
 }
 
 // the recurrent state store: the last n_cols rows of the padded buffer, as [lag, channel]
