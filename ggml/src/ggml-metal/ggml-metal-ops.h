@@ -123,6 +123,8 @@ int  ggml_metal_op_inkling2_situ    (ggml_metal_op_t ctx, int idx);
 void ggml_metal_ops_profile_dump(void);
 void ggml_metal_ops_profile_time_add(enum ggml_op op, uint64_t ns);
 void ggml_metal_ops_profile_time_dump(void);
+void ggml_metal_ops_profile_depth_add(int depth, enum ggml_op op, uint64_t ns);
+void ggml_metal_ops_profile_depth_dump(void);
 
 #ifdef __cplusplus
 }

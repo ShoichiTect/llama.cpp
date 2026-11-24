@@ -3,6 +3,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>
+#include <map>
+#include <vector>
+#include <utility>
 
 #include "ggml.h"
 #include "ggml-impl.h"
@@ -225,6 +228,63 @@ extern "C" void ggml_metal_ops_profile_time_dump(void) {
         g_prof_ns[best].store(0);
         g_prof_tcount[best].store(0);
     }
+}
+
+// --- barrier depth ごとのプロファイラ(GGML_METAL_PROFILE_DEPTH=1 で有効)---
+// graph の各 node の depth(= 依存の段数)ごとに、dispatch 数と GPU 時間を積む。
+// 「同じ段に何個の op が並んでいるか」= 融合でまとめられる余地、が見える。
+struct ggml_metal_prof_depth_entry {
+    uint64_t n_disp = 0;
+    uint64_t ns     = 0;
+    std::map<enum ggml_op, uint64_t> ops;
+};
+
+static std::map<int, ggml_metal_prof_depth_entry> g_prof_depth;
+
+extern "C" void ggml_metal_ops_profile_depth_add(int depth, enum ggml_op op, uint64_t ns) {
+    auto & e = g_prof_depth[depth];
+    e.n_disp += 1;
+    e.ns     += ns;
+    e.ops[op] += 1;
+}
+
+extern "C" void ggml_metal_ops_profile_depth_dump(void) {
+    uint64_t total_ns = 0;
+    uint64_t total_disp = 0;
+    int max_depth = 0;
+    for (const auto & kv : g_prof_depth) {
+        total_ns   += kv.second.ns;
+        total_disp += kv.second.n_disp;
+        max_depth   = std::max(max_depth, kv.first);
+    }
+
+    fprintf(stderr, "[metal-depth] levels=%d dispatches=%llu gpu_total=%.3f ms\n",
+            max_depth + 1, (unsigned long long) total_disp, total_ns/1e6);
+
+    for (const auto & kv : g_prof_depth) {
+        const int depth = kv.first;
+        const auto & e = kv.second;
+
+        // op を多い順に最大 3 個まで
+        std::vector<std::pair<uint64_t, enum ggml_op>> top;
+        for (const auto & op_kv : e.ops) {
+            top.emplace_back(op_kv.second, op_kv.first);
+        }
+        std::sort(top.begin(), top.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+
+        char mix[128] = "";
+        size_t off = 0;
+        for (size_t i = 0; i < top.size() && i < 3; ++i) {
+            off += snprintf(mix + off, sizeof(mix) - off, "%s%s x%llu", i ? " + " : "",
+                    ggml_op_name(top[i].second), (unsigned long long) top[i].first);
+        }
+
+        fprintf(stderr, "[metal-depth]   d=%-3d n=%5llu  %9.3f ms  %5.1f%%  %s\n",
+                depth, (unsigned long long) e.n_disp, e.ns/1e6,
+                100.0*(double) e.ns/(double)(total_ns ? total_ns : 1), mix);
+    }
+
+    g_prof_depth.clear();
 }
 
 extern "C" void ggml_metal_ops_profile_dump(void) {

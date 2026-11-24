@@ -471,6 +471,94 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+static bool ggml_metal_profile_depth_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("GGML_METAL_PROFILE_DEPTH") != NULL ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+// 各 node の depth(依存の段数)を返す。graph は topological 順なので 1 パスで済む。
+// 戻り値は caller が free する。
+static int * ggml_metal_profile_depth(const struct ggml_cgraph * gf) {
+    const int n = gf->n_nodes;
+    if (n <= 0) {
+        return NULL;
+    }
+
+    int * depth = (int *) calloc(n, sizeof(int));
+    if (!depth) {
+        return NULL;
+    }
+
+    int size = 1;
+    while (size < 2*n) {
+        size <<= 1;
+    }
+
+    int * tab = (int *) calloc(size, sizeof(int)); // tensor ptr -> node index + 1
+    if (!tab) {
+        free(depth);
+        return NULL;
+    }
+
+    for (int i = 0; i < n; ++i) {
+        const struct ggml_tensor * node = gf->nodes[i];
+
+        size_t h = ((uintptr_t) node >> 4) & (size_t) (size - 1);
+        while (tab[h] != 0) {
+            h = (h + 1) & (size_t) (size - 1);
+        }
+        tab[h] = i + 1;
+
+        int d = 0;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const struct ggml_tensor * src = node->src[s];
+            if (!src) {
+                break;
+            }
+
+            size_t hs = ((uintptr_t) src >> 4) & (size_t) (size - 1);
+            while (tab[hs] != 0) {
+                const int j = tab[hs] - 1;
+                if (gf->nodes[j] == src) {
+                    if (depth[j] + 1 > d) {
+                        d = depth[j] + 1;
+                    }
+                    break;
+                }
+                hs = (hs + 1) & (size_t) (size - 1);
+            }
+        }
+
+        depth[i] = d;
+    }
+
+    free(tab);
+
+    return depth;
+}
+
+static bool ggml_metal_profile_node_encodes(const struct ggml_tensor * node) {
+    if (ggml_is_empty(node)) {
+        return false;
+    }
+
+    switch (node->op) {
+        case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_TRANSPOSE:
+        case GGML_OP_PERMUTE:
+            return false;
+        default:
+            break;
+    }
+
+    return (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+}
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
@@ -480,6 +568,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     if (gf->n_nodes == 0) {
         return GGML_STATUS_SUCCESS;
     }
+
+    int * prof_depth = NULL;
 
     // number of nodes encoded by the main thread (empirically determined)
     const int n_main = MAX(64, 0.1*gf->n_nodes);
@@ -563,6 +653,10 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // short-hand
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
 
+        if (ggml_metal_profile_depth_enabled()) {
+            prof_depth = ggml_metal_profile_depth(gf);
+        }
+
         // op ごとの GPU 時間を測るモード: 1 node = 1 command buffer にして直列化する
         // (融合・並列は効かなくなるが、どの op が時間を使っているかの帰属が分かる)
         if (getenv("GGML_METAL_PROFILE_GPU")) {
@@ -603,6 +697,10 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                 }
 
                 ggml_metal_ops_profile_time_add(gf->nodes[idx]->op, t > 0 ? (uint64_t) (t*1e9) : 0);
+
+                if (prof_depth && ggml_metal_profile_node_encodes(gf->nodes[idx])) {
+                    ggml_metal_ops_profile_depth_add(prof_depth[idx], gf->nodes[idx]->op, t > 0 ? (uint64_t) (t*1e9) : 0);
+                }
             }
 
             ctx->cmd_buf_last = nil;
@@ -613,6 +711,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                 ggml_metal_ops_profile_dump();
             }
             ggml_metal_ops_profile_time_dump();
+
+            if (prof_depth) {
+                ggml_metal_ops_profile_depth_dump();
+                free(prof_depth);
+            }
 
             return GGML_STATUS_SUCCESS;
         }
@@ -734,6 +837,17 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
     if (getenv("GGML_METAL_PROFILE")) {
         ggml_metal_ops_profile_dump();
+    }
+
+    if (prof_depth) {
+        for (int i = 0; i < gf->n_nodes; ++i) {
+            const struct ggml_tensor * node = gf->nodes[i];
+            if (ggml_metal_profile_node_encodes(node)) {
+                ggml_metal_ops_profile_depth_add(prof_depth[i], node->op, 0);
+            }
+        }
+        ggml_metal_ops_profile_depth_dump();
+        free(prof_depth);
     }
 
     return GGML_STATUS_SUCCESS;
