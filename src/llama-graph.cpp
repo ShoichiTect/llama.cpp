@@ -4589,9 +4589,10 @@ ggml_tensor * llm_graph_context::build_attn(
     // the kernel computes mask[kv,t,h] = rel_bias[h, clamp(q_pos[t] - kv_pos[kv], 0, extent), t] - sink[h,t]
     // and adds the base mask, so the n_kv*n_tps*n_head mask and its blk scan (n_head times the mask
     // read per layer) are both gone. LLAMA_INKLING2_FA_RELBIAS=<0|1> selects it for A/B
+    // default on; LLAMA_INKLING2_FA_RELBIAS=0 falls back to the materialised mask
     static const bool use_fa_rel_bias = [] {
         const char * e = std::getenv("LLAMA_INKLING2_FA_RELBIAS");
-        return e && atoi(e) != 0;
+        return !e || atoi(e) != 0;
     }();
 
     if (use_fa_rel_bias &&
