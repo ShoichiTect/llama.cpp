@@ -1612,36 +1612,6 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         return true;
     }
 
-    if (op->op == GGML_OP_INKLING2_MASK) {
-        const struct ggml_tensor * bias = op->src[0];
-        const struct ggml_tensor * r    = op->src[1];
-        const struct ggml_tensor * sink   = op->src[2];
-        const struct ggml_tensor * kv_pos = op->src[3];
-        const struct ggml_tensor * q_pos  = op->src[4];
-        const struct ggml_tensor * mask   = op->src[5];
-        if (op->ne[2] > 64) {
-            return false;
-        }
-        if (bias->type != GGML_TYPE_F32 || r->type != GGML_TYPE_F32 || sink->type != GGML_TYPE_F32) {
-            return false;
-        }
-        if (bias->nb[0] != sizeof(float) || r->nb[0] != sizeof(float) || sink->nb[0] != sizeof(float)) {
-            return false;
-        }
-        if (kv_pos->type != GGML_TYPE_I32 || kv_pos->nb[0] != sizeof(int32_t)) {
-            return false;
-        }
-        if (q_pos->type != GGML_TYPE_I32 || q_pos->nb[0] != sizeof(int32_t)) {
-            return false;
-        }
-        if (mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_F32) {
-            return false;
-        }
-        if (op->type != mask->type) {
-            return false;
-        }
-        return true;
-    }
 
     if (op->op == GGML_OP_INKLING2_MIX) {
         const struct ggml_tensor * states = op->src[0];

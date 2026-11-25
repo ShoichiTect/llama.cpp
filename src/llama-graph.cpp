@@ -21,6 +21,17 @@
 #include <cstdlib>
 #include <cmath>
 #include <algorithm>
+
+// inkling2 (P2b): hand the relative distance bias to the flash attention kernel instead of building a
+// per-head mask. LLAMA_INKLING2_FA_RELBIAS=0 selects the generic get_rows mask, which is also what
+// every backend without a bias-aware flash attention gets
+static bool use_fa_rel_bias() {
+    static const bool enabled = [] {
+        const char * e = std::getenv("LLAMA_INKLING2_FA_RELBIAS");
+        return !e || atoi(e) != 0;
+    }();
+    return enabled;
+}
 #include <array>
 #include <cstring>
 #include <numeric>
@@ -4534,8 +4545,9 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     ggml_set_input(inp->self_q_pos_swa);
     ggml_set_name(inp->self_q_pos_swa, "attn_inp_q_pos_swa");
 
-    // the distance tensor is only needed by the generic mask path, which is an A/B tool
-    if (getenv("LLAMA_FA_MASK_FUSE_CAP_MB")) {
+    // the distance tensor is only needed by the generic mask path, i.e. when the bias is not handed to
+    // the attention kernel: 387 MB of input plus a host loop over the whole cache per ubatch
+    if (!use_fa_rel_bias() || !cparams.flash_attn) {
         inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
         ggml_set_input(inp->self_rel_pos);
         ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
@@ -4586,16 +4598,11 @@ ggml_tensor * llm_graph_context::build_attn(
     const int64_t n_bucket = rel_bias->ne[1];
 
     // P2b: hand the relative bias to the attention kernel instead of materialising a per-head mask.
-    // the kernel computes mask[kv,t,h] = rel_bias[h, clamp(q_pos[t] - kv_pos[kv], 0, extent), t] - sink[h,t]
-    // and adds the base mask, so the n_kv*n_tps*n_head mask and its blk scan (n_head times the mask
-    // read per layer) are both gone. LLAMA_INKLING2_FA_RELBIAS=<0|1> selects it for A/B
-    // default on; LLAMA_INKLING2_FA_RELBIAS=0 falls back to the materialised mask
-    static const bool use_fa_rel_bias = [] {
-        const char * e = std::getenv("LLAMA_INKLING2_FA_RELBIAS");
-        return !e || atoi(e) != 0;
-    }();
-
-    if (use_fa_rel_bias &&
+    // the kernel computes mask[kv,t,h] = rel_bias[h, clamp(q_pos[t] - kv_pos[kv], 0, extent), t] + base,
+    // so the n_kv*n_tps*n_head mask and its blk scan (n_head times the mask read per layer) are gone.
+    // LLAMA_INKLING2_FA_RELBIAS=0 selects the generic get_rows mask below, for A/B and for backends
+    // whose flash attention cannot take the bias
+    if (use_fa_rel_bias() &&
         cparams.flash_attn &&
         rel_bias->op == GGML_OP_INKLING2_RELBIAS && rel_bias->src[0] && rel_bias->src[1] && rel_bias->src[2] &&
         mask->type == GGML_TYPE_F16) {
@@ -4605,49 +4612,16 @@ ggml_tensor * llm_graph_context::build_attn(
                 nullptr, mask, nullptr, sinks, nullptr, kq_scale, il, &rb);
     }
 
-    // a mask per head, in the dense layout of the input mask and of its type (F16 for flash attention)
+    // the generic path: get_rows(bias, rel_pos) -> permute+copy -> add(base mask) -> cast
+    GGML_ASSERT(rel_pos != nullptr && "the generic mask path needs its own rel_pos input");
+
     ggml_tensor * kq_mask = nullptr;
 
     // the bias of all rows at once is n_kv x n_tokens x n_head in F32, which does not fit at long context:
     // the full-attention layers write the mask a few query rows at a time, at most 32 chunks
     const int64_t n_rows = is_swa ? n_tps : std::max<int64_t>(32, (n_tps + 31)/32);
 
-    // one fused op for the whole mask when it is a plain [n_kv, t] bias: the generic path below
-    // moves ~130 MB per layer (gather, transposing copy, add, cast) at a few GB/s, and it needs an
-    // F32 [n_head, n_kv, n_tps] intermediate, i.e. ~4x the memory of the mask it produces
-    //
-    // the mask is still materialised on purpose, and that is what limits the ubatch size at long
-    // context: n_kv*n_tps*n_head*sizeof(mask) bytes per attention layer. the fix is to hand the
-    // relative bias to the attention kernel instead of building a mask, which replaces exactly the
-    // kq_mask computed here (see the prefill notes, item P2)
-    //
-    // LLAMA_FA_MASK_FUSE_CAP_MB=<n>: force the generic path for masks larger than n MB, to
-    // reproduce the old default and to A/B both builds of the same mask in one binary. unset or
-    // <= 0 means no limit
-    static const size_t mask_fuse_cap = [] {
-        const char * e = std::getenv("LLAMA_FA_MASK_FUSE_CAP_MB");
-        const int mb = e ? atoi(e) : 0;
-        return mb > 0 ? (size_t) mb * 1024 * 1024 : (size_t) -1;
-    }();
-
-    const bool can_fuse = rel_bias->op == GGML_OP_INKLING2_RELBIAS &&
-        rel_bias->src[0] && rel_bias->src[1] && rel_bias->src[2] &&
-        (mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32) &&
-        n_kv*n_tps*n_head*n_stream*ggml_type_size(mask->type) <= mask_fuse_cap;
-
-    if (can_fuse) {
-        ggml_tensor * fused = ggml_new_tensor_4d(ctx0, mask->type, n_kv, n_tps, n_head, n_stream);
-        fused->op     = GGML_OP_INKLING2_MASK;
-        fused->src[0] = rel_bias->src[0]; // [n_rel, n_bucket], the pad bucket is a zero row
-        fused->src[1] = rel_bias->src[1]; // [n_rel, n_head, n_tokens]
-        fused->src[2] = rel_bias->src[2]; // [1, n_head, n_tokens]
-        fused->src[3] = kv_pos;           // i32 [n_kv, n_stream], -1 for the empty cells
-        fused->src[4] = q_pos;            // i32 [n_tokens], the streams are contiguous
-        fused->src[5] = mask;             // base mask, broadcast over the heads
-
-        kq_mask = fused;
-    } else if (n_rows >= n_tps) {
-        GGML_ASSERT(rel_pos != nullptr && "the generic mask path needs LLAMA_FA_MASK_FUSE_CAP_MB");
+    if (n_rows >= n_tps) {
         // [n_head, n_kv, n_tokens] -> [n_kv, n_tps, n_head, n_stream]
         ggml_tensor * kq_b = ggml_get_rows(ctx0, rel_bias, rel_pos);
         kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tps, n_stream);
@@ -4658,7 +4632,6 @@ ggml_tensor * llm_graph_context::build_attn(
             kq_mask = ggml_cast(ctx0, kq_mask, mask->type);
         }
     } else {
-        GGML_ASSERT(rel_pos != nullptr && "the generic mask path needs LLAMA_FA_MASK_FUSE_CAP_MB");
         // the scheduler copies each view of an input to the device on its own, copy the whole input once instead
         rel_pos = ggml_cont(ctx0, rel_pos);
 

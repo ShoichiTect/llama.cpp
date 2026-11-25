@@ -286,27 +286,6 @@ struct ggml_metal_kargs_inkling2_relbias {
     int64_t nb2_sink;
 };
 
-// inkling2: the attention mask, out[kv,t,h,s] = bias[:, pos[kv,t,s]] . r[:,h,t] - sink[h,t] + mask[kv,t,s]
-struct ggml_metal_kargs_inkling2_mask {
-    int32_t n_rel;
-    int32_t n_ext;
-    int32_t n_kv;
-    int32_t n_tps;
-    int32_t n_head;
-    int32_t n_stream;
-    int32_t src_f16;
-    int32_t dst_f16;
-    int32_t nth_kv;
-    int64_t nb1_b;
-    int64_t nb1_r;
-    int64_t nb2_r;
-    int64_t nb1_sink;
-    int64_t nb2_sink;
-    int64_t nb1_m;
-    int64_t nb2_m;
-    int64_t nb3_m;
-};
-
 // inkling2: attention over the depth, out[e, m, t] = sum_s softmax_s(scale*sum_k states[k,s,t]*q[k,m,t])*states[e,s,t]
 struct ggml_metal_kargs_inkling2_mix {
     int32_t n_embd;
