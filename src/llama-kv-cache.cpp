@@ -1,5 +1,6 @@
 #include "llama-kv-cache.h"
 
+#include "ggml-backend.h"
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -1049,6 +1050,25 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             return { };
         }
 
+        // inkling2_loop (S28): a bank replay re-feeds an interval that is already in the cache. the
+        //   cells of those positions keep their place - a new cell with the same position would be a
+        //   second, duplicate key for the same token and the deep pass would attend to both.
+        if (allow_replay) {
+            const auto & seq_pos = cells.seq_pos_get(seq_id);
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                const auto it = seq_pos.lower_bound({ ubatch.pos[i], 0 });
+                if (it == seq_pos.end() || it->first != ubatch.pos[i]) {
+                    res.idxs[s].clear();
+                    break;
+                }
+                res.idxs[s].push_back(it->second);
+            }
+
+            if (res.idxs[s].size() == n_tokens) {
+                continue;
+            }
+        }
+
         uint32_t n_tested = 0;
 
         // for continuous slots, we test that all tokens in the ubatch fit, starting from the current head
@@ -1198,7 +1218,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence
     //       will be present in the cache. so we have to purge any position which is less than those we would overwrite
     //       ref: https://github.com/ggml-org/llama.cpp/pull/13746#issuecomment-2916057092
-    for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+    //       inkling2_loop (S28): a replay writes the same positions that it reuses, so nothing is overwritten
+    for (uint32_t s = 0; s < (allow_replay ? 0u : (uint32_t) LLAMA_MAX_SEQ); ++s) {
         if (seq_pos_max_rm[s] == -1) {
             continue;
         }
@@ -1478,6 +1499,53 @@ ggml_tensor * llama_kv_cache::get_v_scale(int32_t il) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     return layers[ikv].v_scale;
+}
+
+bool llama_kv_cache::copy_kv_rows(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int32_t il_src, int32_t il_dst) {
+    const auto it_src = map_layer_ids.find(il_src);
+    const auto it_dst = map_layer_ids.find(il_dst);
+    if (it_src == map_layer_ids.end() || it_dst == map_layer_ids.end()) {
+        return false;
+    }
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+    if (v_trans) {
+        return false;
+    }
+
+    const auto & layer_src = layers[it_src->second];
+    const auto & layer_dst = layers[it_dst->second];
+
+    if (!layer_src.k || !layer_src.v || !layer_dst.k || !layer_dst.v) {
+        return false;
+    }
+    if (layer_src.k->ne[0] != layer_dst.k->ne[0] || layer_src.v->ne[0] != layer_dst.v->ne[0] ||
+        layer_src.k->type != layer_dst.k->type || layer_src.v->type != layer_dst.v->type) {
+        return false;
+    }
+
+    const uint32_t strm = seq_to_stream[seq_id];
+
+    // K and V are [n_embd_gqa, kv_size, n_stream], one contiguous row per cell and stream
+    const size_t n_k = ggml_row_size(layer_src.k->type, layer_src.k->ne[0]);
+    const size_t n_v = ggml_row_size(layer_src.v->type, layer_src.v->ne[0]);
+
+    const auto & seq_pos = v_cells[strm].seq_pos_get(seq_id);
+
+    std::vector<uint8_t> buf(std::max(n_k, n_v));
+
+    for (auto it = seq_pos.lower_bound({ p0, 0 }); it != seq_pos.end() && it->first < p1; ++it) {
+        const size_t off = (size_t) it->second*layer_src.k->nb[1] + (size_t) strm*layer_src.k->nb[2];
+
+        ggml_backend_tensor_get(layer_src.k, buf.data(), off, n_k);
+        ggml_backend_tensor_set(layer_dst.k, buf.data(), off, n_k);
+
+        ggml_backend_tensor_get(layer_src.v, buf.data(), off, n_v);
+        ggml_backend_tensor_set(layer_dst.v, buf.data(), off, n_v);
+    }
+
+    return true;
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {

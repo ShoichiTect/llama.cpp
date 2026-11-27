@@ -138,6 +138,10 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_update(llama_context * l
     return std::make_unique<llama_memory_hybrid_iswa_context>(this, lctx, optimize);
 }
 
+void llama_memory_hybrid_iswa::set_allow_replay(bool value) {
+    mem_attn->set_allow_replay(value);
+}
+
 bool llama_memory_hybrid_iswa::get_can_shift() const {
     // Shifting is trivially supported for recurrent
     return mem_attn->get_can_shift();
@@ -207,6 +211,62 @@ void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq
 
 llama_kv_cache_iswa * llama_memory_hybrid_iswa::get_mem_attn() const {
     return mem_attn.get();
+}
+
+// inkling2_loop (V08): pass-slot substitution. the loop core occupies the physical layers
+//   [n_loop_start, n_loop_end); pass 0 keeps them at their own cache slot and pass p > 0 keeps the
+//   j-th of them at n_loop_phys + (p - 1)*(n_loop_end - n_loop_start) + j (see layer_phys()).
+//   copying the K/V rows of a range of positions between two pass slots makes the attention of a
+//   pass read the K/V that another pass wrote; the rows of new positions still go to the pass's own
+//   slot, because only the existing cells [p0, p1) are replaced.
+int32_t llama_memory_hybrid_iswa::copy_loop_pass_kv(uint32_t pass_src, uint32_t pass_dst, llama_seq_id seq_id,
+        llama_pos p0, llama_pos p1) {
+    if (hparams.n_loop_phys == 0) {
+        return -1;
+    }
+    if (p0 < 0 || p1 <= p0) {
+        return -1;
+    }
+
+    auto * kv_base = mem_attn->get_base();
+    auto * kv_swa  = mem_attn->get_swa();
+
+    const uint32_t n_phys = hparams.n_loop_phys;
+    const uint32_t start  = hparams.n_loop_start;
+    const uint32_t end    = hparams.n_loop_end;
+
+    auto slot = [&](uint32_t pass, uint32_t j) -> int32_t {
+        return pass == 0 ? (int32_t) (start + j)
+                         : (int32_t) (n_phys + (pass - 1)*(end - start) + j);
+    };
+
+    int32_t n_layers = 0;
+
+    for (uint32_t j = 0; j < end - start; ++j) {
+        const int32_t il_src = slot(pass_src, j);
+        const int32_t il_dst = slot(pass_dst, j);
+
+        if (il_src == il_dst) {
+            ++n_layers;
+            continue;
+        }
+        if (kv_base->copy_kv_rows(seq_id, p0, p1, il_src, il_dst)) {
+            ++n_layers;
+            continue;
+        }
+        if (kv_swa->copy_kv_rows(seq_id, p0, p1, il_src, il_dst)) {
+            ++n_layers;
+            continue;
+        }
+
+        LLAMA_LOG_WARN("%s: pass %u -> %u, core layer %u: no cache holds both slots (%d, %d)\n",
+                __func__, pass_src, pass_dst, j, il_src, il_dst);
+    }
+
+    LLAMA_LOG_INFO("%s: seq %d: pass %u -> %u over [%d, %d): %d layers\n",
+            __func__, seq_id, pass_src, pass_dst, (int) p0, (int) p1, n_layers);
+
+    return n_layers;
 }
 
 llama_memory_recurrent * llama_memory_hybrid_iswa::get_mem_recr() const {

@@ -4,6 +4,7 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
+#include "llama-bank.h"
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
@@ -207,6 +208,8 @@ llama_context::llama_context(
                 __func__, params.n_loop_passes, hparams.n_loop_passes);
     }
     cparams.n_layer_use = hparams.n_layer_use(cparams.n_passes);
+    cparams.n_passes_max = cparams.n_passes;
+    n_passes_default    = cparams.n_passes;
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
@@ -1439,6 +1442,254 @@ void llama_context::set_embeddings(bool value) {
     cparams.embeddings = value;
 }
 
+void llama_context::set_loop_passes(uint32_t n_passes) {
+    const auto & hparams = model.hparams;
+    if (hparams.n_loop_phys == 0) {
+        return; // not a looped model
+    }
+
+    uint32_t n = n_passes > 0 ? n_passes : n_passes_default;
+    if (n > hparams.n_loop_passes) {
+        n = hparams.n_loop_passes;
+    }
+    // the context only owns the KV slots of the depth it was created with (see cparams.n_passes_max)
+    if (n > cparams.n_passes_max) {
+        n = cparams.n_passes_max;
+    }
+    if (n < 1) {
+        n = 1;
+    }
+    if (n == cparams.n_passes) {
+        return;
+    }
+
+    // a different depth is a different graph, and the KV slots of the dropped passes are not repaired
+    LLAMA_LOG_DEBUG("%s: n_passes %u -> %u\n", __func__, cparams.n_passes, n);
+    cparams.n_passes    = n;
+    sched_need_reserve  = true;
+}
+
+uint32_t llama_context::get_loop_passes() const {
+    return cparams.n_passes;
+}
+
+// inkling2_loop (V08): pass-slot substitution for the loop core. synchronize first - the rows are
+//   copied through the host, so the pass that wrote the source slot must have finished on the device.
+int32_t llama_context::loop_copy_pass_kv(uint32_t pass_src, uint32_t pass_dst, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    const auto & hparams = model.hparams;
+    if (hparams.n_loop_phys == 0) {
+        LLAMA_LOG_ERROR("%s: not a looped model\n", __func__);
+        return -1;
+    }
+    if (!memory) {
+        LLAMA_LOG_ERROR("%s: the context has no memory\n", __func__);
+        return -1;
+    }
+    if (pass_src >= cparams.n_passes_max || pass_dst >= cparams.n_passes_max) {
+        LLAMA_LOG_ERROR("%s: pass %u -> %u is beyond the depth of the context (%u)\n",
+                __func__, pass_src, pass_dst, cparams.n_passes_max);
+        return -1;
+    }
+
+    synchronize();
+
+    const int32_t n_layers = memory->copy_loop_pass_kv(pass_src, pass_dst, seq_id, p0, p1);
+    if (n_layers < 0) {
+        LLAMA_LOG_ERROR("%s: the memory of this model does not support pass-slot copies\n", __func__);
+    }
+
+    return n_layers;
+}
+
+// inkling2_loop (S25): the full-recompute raise. the shallower run left the pass slots of the deeper
+//   passes empty (see the no-repair path in models/inkling2-loop.cpp), so the only way to get the state
+//   of a uniform deep run back is to run the interval again at the new depth. the KV/conv state of the
+//   interval is dropped (seq_rm) and the tokens are fed as a batch prefill - the cost S05 measured.
+//   p0 == 0 (a full recompute) restores a uniform deep state; p0 > 0 only repairs the tail, because the
+//   layer inputs of the earlier passes are not stored anywhere.
+int32_t llama_context::loop_recompute(uint32_t n_passes, llama_seq_id seq_id, const llama_token * tokens, llama_pos p0, llama_pos p1) {
+    if (!memory) {
+        LLAMA_LOG_ERROR("%s: the context has no memory\n", __func__);
+        return -1;
+    }
+    if (!tokens || p0 < 0 || p1 <= p0) {
+        LLAMA_LOG_ERROR("%s: invalid interval [%d, %d)\n", __func__, (int) p0, (int) p1);
+        return -1;
+    }
+
+    set_loop_passes(n_passes);
+    const uint32_t n_passes_eff = cparams.n_passes;
+    if (n_passes > 0 && n_passes_eff != n_passes) {
+        LLAMA_LOG_WARN("%s: requested depth %u, clamped to %u (the context owns the slots of depth %u)\n",
+                __func__, n_passes, n_passes_eff, cparams.n_passes_max);
+    }
+
+    llama_pos p_start = p0;
+    if (!memory->seq_rm(seq_id, p0, -1)) {
+        // a recurrent state can only roll back a tail that its per-token snapshot covers, so a cut at
+        // an arbitrary position is usually refused. dropping the whole series recomputes the interval
+        // correctly as well - it just costs the whole context instead of the tail.
+        if (!memory->seq_rm(seq_id, -1, -1)) {
+            LLAMA_LOG_ERROR("%s: could not drop the state of seq %d\n", __func__, seq_id);
+            return -1;
+        }
+        p_start = 0;
+        if (p0 > 0) {
+            LLAMA_LOG_WARN("%s: seq %d cannot be cut at pos %d, recomputing [0, %d) instead\n",
+                    __func__, seq_id, (int) p0, (int) p1);
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: seq %d -> %u passes, recompute [%d, %d) (%d tokens)\n",
+            __func__, seq_id, n_passes_eff, (int) p_start, (int) p1, (int) (p1 - p_start));
+
+    const int32_t n_batch = (int32_t) cparams.n_batch;
+    llama_batch_ext batch(this);
+
+    int32_t n_done = 0;
+    for (llama_pos pos = p_start; pos < p1; ) {
+        const int32_t n = std::min<int32_t>(n_batch, (int32_t) (p1 - pos));
+
+        batch.clear();
+        for (int32_t k = 0; k < n; ++k) {
+            const int32_t idx = batch.add_token(seq_id);
+            if (idx < 0) {
+                LLAMA_LOG_ERROR("%s: could not add token at pos %d (%d)\n", __func__, (int) (pos + k), idx);
+                return -1;
+            }
+            llama_pos p = pos + k;
+            batch.set_token_id(idx, tokens[p]);
+            batch.set_token_pos(idx, &p);
+            // only the last token needs logits (the caller continues from there)
+            batch.set_output(idx, p == p1 - 1);
+        }
+
+        const int ret = decode(batch);
+        if (ret != 0) {
+            LLAMA_LOG_ERROR("%s: recompute of [%d, %d) failed (ret = %d)\n", __func__, (int) pos, (int) (pos + n), ret);
+            return -1;
+        }
+
+        pos    += n;
+        n_done += n;
+    }
+
+    return n_done;
+}
+
+// inkling2_loop (S28): the activation bank.
+//
+//   a raise d -> d + 1 needs, for every token of the interval, the tensors the pass d would consume
+//   (its input, the cross-depth blocks of the passes below and their output). those are stored once by
+//   the run at depth d - the bank - and fed back into the graph as inputs by the raise, so the raise
+//   replays the deepest pass alone instead of re-running the whole prefix at the deep depth.
+llama_bank * llama_context::bank_create(uint32_t n_cap, ggml_type type) {
+    synchronize();
+
+    if (bank) {
+        LLAMA_LOG_WARN("%s: the context already has a bank, replacing it\n", __func__);
+        llama_bank_destroy(bank);
+    }
+
+    bank = llama_bank_create(*this, n_cap, type);
+    bank_mode = 0;
+
+    return bank;
+}
+
+void llama_context::bank_set_mode(uint32_t mode) {
+    bank_mode = mode;
+}
+
+void llama_context::bank_write(bool value) {
+    if (!bank) {
+        LLAMA_LOG_WARN("%s: no bank, ignored\n", __func__);
+        return;
+    }
+
+    bank_mode = value ? (bank_mode == 4 ? 4 : 1) : 0;
+}
+
+int32_t llama_context::loop_raise_bank(uint32_t n_passes, llama_seq_id seq_id, const llama_token * tokens, llama_pos p0, llama_pos p1, uint32_t graph_mode) {
+    if (!bank) {
+        LLAMA_LOG_ERROR("%s: the context has no bank\n", __func__);
+        return -1;
+    }
+    if (!tokens || p0 < 0 || p1 <= p0) {
+        LLAMA_LOG_ERROR("%s: invalid interval [%d, %d)\n", __func__, (int) p0, (int) p1);
+        return -1;
+    }
+    // the bank holds what the next pass consumes, so this is a raise by exactly one pass
+    if (n_passes != cparams.n_passes + 1) {
+        LLAMA_LOG_ERROR("%s: the bank of depth %u raises to %u, not to %u\n",
+                __func__, cparams.n_passes, cparams.n_passes + 1, n_passes);
+        return -1;
+    }
+
+    set_loop_passes(n_passes);
+    if (cparams.n_passes != n_passes) {
+        LLAMA_LOG_ERROR("%s: depth %u is not available (the context owns the slots of depth %u)\n",
+                __func__, n_passes, cparams.n_passes_max);
+        return -1;
+    }
+
+    LLAMA_LOG_INFO("%s: seq %d -> %u passes, replay [%d, %d) (%d tokens) from the bank\n",
+            __func__, seq_id, n_passes, (int) p0, (int) p1, (int) (p1 - p0));
+
+    const uint32_t bank_mode_prev = bank_mode;
+    bank_mode = graph_mode;
+    // the replay re-feeds an interval that is already in the memory, so the positions do not advance and
+    // the KV cells of those positions are reused instead of duplicated
+    balloc->set_allow_replay(true);
+    if (memory) {
+        memory->set_allow_replay(true);
+    }
+
+    const int32_t n_batch = (int32_t) cparams.n_batch;
+    llama_batch_ext batch(this);
+
+    int32_t n_done = 0;
+    for (llama_pos pos = p0; pos < p1; ) {
+        const int32_t n = std::min<int32_t>(n_batch, (int32_t) (p1 - pos));
+
+        batch.clear();
+        for (int32_t k = 0; k < n; ++k) {
+            const int32_t idx = batch.add_token(seq_id);
+            if (idx < 0) {
+                LLAMA_LOG_ERROR("%s: could not add token at pos %d (%d)\n", __func__, (int) (pos + k), idx);
+                bank_mode = bank_mode_prev;
+                return -1;
+            }
+            llama_pos p = pos + k;
+            batch.set_token_id(idx, tokens[p]);
+            batch.set_token_pos(idx, &p);
+            batch.set_output(idx, p == p1 - 1);
+        }
+
+        const int ret = decode(batch);
+        if (ret != 0) {
+            LLAMA_LOG_ERROR("%s: bank replay of [%d, %d) failed (ret = %d)\n", __func__, (int) pos, (int) (pos + n), ret);
+            balloc->set_allow_replay(false);
+            if (memory) {
+                memory->set_allow_replay(false);
+            }
+            bank_mode = bank_mode_prev;
+            return -1;
+        }
+
+        pos    += n;
+        n_done += n;
+    }
+
+    balloc->set_allow_replay(false);
+    if (memory) {
+        memory->set_allow_replay(false);
+    }
+    bank_mode = bank_mode_prev;
+
+    return n_done;
+}
+
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
@@ -2236,6 +2487,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     }
 
+    // inkling2_loop (S32): group the ubatch splits by effective depth, so that tokens of different
+    //   requests (slots) at different depths end up in different ubatches of the same decode
+    balloc->set_default_n_passes(cparams.n_passes);
+
     if (!balloc->init(batch_inp, vocab, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
@@ -2372,8 +2627,38 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ggml_backend_event_wait(h_nextn_backend, ev_h_nextn_read.get());
     }
 
+    // inkling2_loop (E8): observability for the per-ubatch depth. the interesting case is a mixed-depth
+    //   request (e.g. prompt at d3 and generation at d2): the INFO transition lines make the switch
+    //   visible without a debug build, the per-ubatch lines are DEBUG, and the summary is printed
+    //   only when one batch actually ran at more than one depth (otherwise every decode step would
+    //   print it during generation). n_passes_log_last is a member so that the transition is also
+    //   reported when the switch happens between two decode() calls (prompt -> first generated token).
+    std::unordered_map<uint32_t, uint64_t> n_ubatch_by_depth;
+    std::unordered_map<uint32_t, uint64_t> n_tokens_by_depth;
+
     do {
         const auto & ubatch = mctx->get_ubatch();
+
+        {
+            // the effective depth, the same rule as graph_params(): a value deeper than the context
+            // default cannot be honored because the KV slots were sized for the default
+            const uint32_t n_passes_ub = ubatch.n_passes > 0 && ubatch.n_passes < cparams.n_passes
+                                       ? ubatch.n_passes : cparams.n_passes;
+
+            n_ubatch_by_depth[n_passes_ub]++;
+            n_tokens_by_depth[n_passes_ub] += ubatch.n_tokens;
+
+            if (n_passes_log_last != 0 && n_passes_ub != n_passes_log_last) {
+                LLAMA_LOG_INFO("%s: loop depth %u -> %u at n_tokens = %u (pos = [%d, %d])\n",
+                        __func__, n_passes_log_last, n_passes_ub, ubatch.n_tokens,
+                        ubatch.pos[0], ubatch.pos[ubatch.n_tokens - 1]);
+            } else {
+                LLAMA_LOG_DEBUG("%s: ubatch: n_passes = %u, n_tokens = %u (pos = [%d, %d])\n",
+                        __func__, n_passes_ub, ubatch.n_tokens,
+                        ubatch.pos[0], ubatch.pos[ubatch.n_tokens - 1]);
+            }
+            n_passes_log_last = n_passes_ub;
+        }
 
         // count the outputs in this ubatch
         {
@@ -2631,6 +2916,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 output_ids[out_ids[i]] = i;
             }
         }
+    }
+
+    if (n_ubatch_by_depth.size() > 1) {
+        std::string summary;
+        for (const auto & [n_passes_ub, n_ub] : n_ubatch_by_depth) {
+            if (!summary.empty()) {
+                summary += ", ";
+            }
+            summary += std::to_string(n_passes_ub) + " = " + std::to_string(n_ub) + " ubatch / "
+                     + std::to_string(n_tokens_by_depth[n_passes_ub]) + " tok";
+        }
+        LLAMA_LOG_INFO("%s: mixed loop depth in one batch: %s\n", __func__, summary.c_str());
     }
 
     // wait for the computation to finish (automatically done when obtaining the model output)
@@ -3082,9 +3379,19 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    // inkling2_loop: the ubatch can ask for a shallower depth than the context default. the depth is part of
+    //   the graph topology, so it travels in cparams of the params copy: the graph builder reads it and
+    //   llm_graph_params::allow_reuse rejects a graph built for another depth.
+    //   deeper than the context default is not possible - the KV slots were sized for the default.
+    llama_cparams cparams_ub = cparams;
+    if (ubatch.n_passes > 0 && ubatch.n_passes < cparams_ub.n_passes) {
+        cparams_ub.n_passes    = ubatch.n_passes;
+        cparams_ub.n_layer_use = model.hparams.n_layer_use(cparams_ub.n_passes);
+    }
+
     return {
         /*.model       =*/ &model,
-        /*.cparams     =*/ cparams,
+        /*.cparams     =*/ cparams_ub,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched.get(),
@@ -3098,6 +3405,8 @@ llm_graph_params llama_context::graph_params(
         /*.layer_inp_src =*/ supports_embd_row() ? cparams.ctx_other->get_layer_inp_dev() : nullptr,
         /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
         /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,
+        /*.bank          =*/ bank ? bank->data : std::vector<ggml_tensor *>(),
+        /*.bank_mode     =*/ bank_mode,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -4654,6 +4963,112 @@ void llama_detach_threadpool(llama_context * ctx) {
 
 void llama_set_n_threads(llama_context * ctx, int32_t n_threads, int32_t n_threads_batch) {
     ctx->set_n_threads(n_threads, n_threads_batch);
+}
+
+void llama_set_loop_passes(llama_context * ctx, uint32_t n_passes) {
+    ctx->set_loop_passes(n_passes);
+}
+
+uint32_t llama_get_loop_passes(const llama_context * ctx) {
+    return ctx->get_loop_passes();
+}
+
+int32_t llama_loop_copy_pass_kv(
+        llama_context * ctx,
+        uint32_t pass_src,
+        uint32_t pass_dst,
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1) {
+    return ctx->loop_copy_pass_kv(pass_src, pass_dst, seq_id, p0, p1);
+}
+
+int32_t llama_loop_recompute(
+        llama_context * ctx,
+             uint32_t   n_passes,
+           llama_seq_id   seq_id,
+     const llama_token *  tokens,
+            llama_pos     p0,
+            llama_pos     p1) {
+    return ctx->loop_recompute(n_passes, seq_id, tokens, p0, p1);
+}
+
+// inkling2_loop (S28): the activation bank of the loop core
+llama_bank * llama_bank_init(llama_context * ctx, uint32_t n_cap, ggml_type type) {
+    if (!ctx) {
+        return nullptr;
+    }
+    return ctx->bank_create(n_cap, type);
+}
+
+void llama_bank_free(struct llama_bank * bank) {
+    llama_bank_destroy(bank);
+}
+
+size_t llama_bank_size(const struct llama_bank * bank) {
+    return bank && !bank->data.empty() ? ggml_nbytes(bank->data[0])*bank->n_slot : 0;
+}
+
+size_t llama_bank_bytes_per_token(const struct llama_bank * bank) {
+    if (!bank || bank->n_cap == 0) {
+        return 0;
+    }
+    return ggml_nbytes(bank->data[0])*bank->n_slot/bank->n_cap;
+}
+
+uint32_t llama_bank_n_slot(const struct llama_bank * bank) {
+    return bank ? bank->n_slot : 0;
+}
+
+size_t llama_bank_get(const struct llama_bank * bank, uint32_t slot, llama_pos pos0, llama_pos n_pos, float * out) {
+    if (!bank || bank->data.empty() || !out || slot >= bank->n_slot || pos0 < 0 || n_pos <= 0 || (uint32_t) (pos0 + n_pos) > bank->n_cap) {
+        return 0;
+    }
+
+    ggml_init_params params = { ggml_tensor_overhead()*4, nullptr, true };
+    ggml_context_ptr ctx(ggml_init(params));
+
+    ggml_tensor * rows = ggml_view_2d(ctx.get(), bank->data[slot], bank->n_embd, n_pos, bank->data[slot]->nb[1], pos0*bank->data[slot]->nb[1]);
+
+    if (bank->data[slot]->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(rows, out, 0, (size_t) bank->n_embd*n_pos*sizeof(float));
+        return (size_t) bank->n_embd*n_pos;
+    }
+
+    std::vector<uint16_t> tmp((size_t) bank->n_embd*n_pos);
+    ggml_backend_tensor_get(rows, tmp.data(), 0, tmp.size()*sizeof(uint16_t));
+    ggml_fp16_to_fp32_row(tmp.data(), out, tmp.size());
+
+    return tmp.size();
+}
+
+void llama_bank_set_write(struct llama_context * ctx, bool value) {
+    ctx->bank_write(value);
+}
+
+void llama_bank_set_mode(struct llama_context * ctx, uint32_t mode) {
+    ctx->bank_set_mode(mode);
+}
+
+int32_t llama_loop_raise_bank(
+        llama_context * ctx,
+             uint32_t   n_passes,
+           llama_seq_id   seq_id,
+     const llama_token *  tokens,
+            llama_pos     p0,
+            llama_pos     p1) {
+    return ctx->loop_raise_bank(n_passes, seq_id, tokens, p0, p1, 2);
+}
+
+int32_t llama_loop_raise_bank_mode(
+        llama_context * ctx,
+             uint32_t   n_passes,
+           llama_seq_id   seq_id,
+     const llama_token *  tokens,
+            llama_pos     p0,
+            llama_pos     p1,
+             uint32_t   mode) {
+    return ctx->loop_raise_bank(n_passes, seq_id, tokens, p0, p1, mode);
 }
 
 int32_t llama_n_threads(llama_context * ctx) {

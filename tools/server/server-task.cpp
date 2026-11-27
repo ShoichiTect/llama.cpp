@@ -123,6 +123,8 @@ json task_params::to_json(bool only_metrics) const {
         {"n_predict",                 n_predict}, // TODO: deduplicate?
         {"n_keep",                    n_keep},
         {"n_discard",                 n_discard},
+        {"loop_passes",               n_loop_passes},
+        {"loop_passes_prompt",        n_loop_passes_prompt},
         {"ignore_eos",                sampling.ignore_eos},
         {"stream",                    stream},
         {"logit_bias",                format_logit_bias(sampling.logit_bias)},

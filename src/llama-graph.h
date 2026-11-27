@@ -193,6 +193,20 @@ public:
     ggml_tensor * idxs = nullptr; // I64 [n_batch]
 };
 
+// inkling2_loop (S28): the absolute positions of the ubatch tokens, used as the rows of the activation
+//   bank. a raise replays an interval of a sequence, so the positions are not the batch indices.
+class llm_graph_input_bank_pos : public llm_graph_input_i {
+public:
+    llm_graph_input_bank_pos() = default;
+    virtual ~llm_graph_input_bank_pos() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * pos = nullptr; // I32 [n_batch] (get_rows takes I32)
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd, llama_rope_section_order rope_section_order = LLAMA_ROPE_SECTION_ORDER_TYXZ)
@@ -886,6 +900,11 @@ struct llm_graph_params {
     ggml_tensor * h_nextn_dev   = nullptr; // own h_nextn device buffer (write)
     ggml_tensor * h_nextn_src   = nullptr; // ctx_state_src's h_nextn device buffer (read)
 
+    // inkling2_loop (S28): the activation bank of the loop core, and what to do with it
+    //   one tensor per slot, [n_embd, n_cap]
+    std::vector<ggml_tensor *> bank;
+    uint32_t                   bank_mode = 0; // 0 off, 1 write, 2 read, 3 read (keep the passes below)
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -970,6 +989,16 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        // inkling2_loop: the number of passes changes the graph topology (and which KV slots are touched)
+        if (cparams.n_passes != other.cparams.n_passes) {
+            return false;
+        }
+
+        // inkling2_loop (S28): the bank mode changes the graph (the prelude is skipped when reading)
+        if (bank != other.bank || bank_mode != other.bank_mode) {
             return false;
         }
 

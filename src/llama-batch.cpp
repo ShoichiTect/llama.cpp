@@ -263,6 +263,10 @@ bool llama_batch_allocr::init(
             decision_group.resize(n_tok, 0);
             decision_group[i] = batch_inp.tokens[i].decision_group;
         }
+        if (batch_inp.tokens[i].n_passes != 0) {
+            n_passes.resize(n_tok, 0);
+            n_passes[i] = batch_inp.tokens[i].n_passes;
+        }
     }
 
     //
@@ -358,6 +362,7 @@ bool llama_batch_allocr::init(
             /*.type         =*/ is_embd_vec.empty() ? nullptr : is_embd_vec.data(),
             /*.decision_order =*/ decision_order.empty() ? nullptr : decision_order.data(),
             /*.decision_group =*/ decision_group.empty() ? nullptr : decision_group.data(),
+            /*.n_passes       =*/ 0,
             /*.data         =*/ {},
         };
 
@@ -446,7 +451,11 @@ bool llama_batch_allocr::init(
             if (p0 >= 0) {
                 bool ok = true;
 
-                if (seq_pos_min(s) != p0 + 1) {
+                if (allow_replay) {
+                    // the bank replay re-feeds an interval that is already in the memory: the first
+                    // position must lie inside the stored range, not after it
+                    ok = seq_pos_min(s) <= p0 + 1;
+                } else if (seq_pos_min(s) != p0 + 1) {
                     ok = false;
                 }
 
@@ -585,6 +594,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.type         =*/ nullptr,
         /*.decision_order =*/ nullptr,
         /*.decision_group =*/ nullptr,
+        /*.n_passes     =*/ 0,
         /*.data         =*/ std::move(udata),
     };
 
@@ -629,9 +639,12 @@ void llama_batch_allocr::split_reset() {
 }
 
 llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
-    // find the first unused token
+    // inkling2_loop (S32): 1 ubatch = 1 depth
+    const uint32_t n_passes_cur = split_n_passes();
+
+    // find the first unused token of the current depth
     uint32_t cur_idx = 0;
-    while (cur_idx < used.size() && used[cur_idx]) {
+    while (cur_idx < used.size() && split_skip(cur_idx, n_passes_cur)) {
         ++cur_idx;
     }
 
@@ -657,6 +670,11 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
         if (idxs.size() >= n_ubatch) {
             break;
         }
+
+        // the next token runs at another depth - it goes into the next ubatch
+        if (split_skip(cur_idx, n_passes_cur)) {
+            break;
+        }
     }
 
     return ubatch_add(idxs, idxs.size(), false);
@@ -669,13 +687,29 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         return {};
     }
 
+    // inkling2_loop (S32): 1 ubatch = 1 depth
+    const uint32_t n_passes_cur = split_n_passes();
+
     std::vector<seq_set_t> cur_seq_set;
+
+    // inkling2_loop (S32): evaluate only the frontier (first unused entry) of each sequence set, so that a
+    //   depth change inside a sequence never makes the split take a later token out of order
+    std::unordered_set<seq_set_t> seq_set_seen;
 
     llama_seq_id last_seq_id = -1;
 
     // determine the non-overlapping sequence sets participating in this ubatch
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
         if (used[i]) {
+            continue;
+        }
+
+        // only the tokens that run at the depth of this ubatch
+        if (!seq_set_seen.insert(seq_set[i]).second) {
+            continue;
+        }
+
+        if (entry_n_passes(i) != n_passes_cur) {
             continue;
         }
 
@@ -735,6 +769,12 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
                 can_expand = false;
                 break;
             }
+
+            // the next token of this sequence set runs at another depth - stop this ubatch here
+            if (entry_n_passes(seq_set_map[cur_seq_set[s]][cur_idx[s]]) != n_passes_cur) {
+                can_expand = false;
+                break;
+            }
         }
 
         if (!can_expand) {
@@ -764,7 +804,14 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         GGML_ASSERT(n_ubatch > n_keep_tail);
 
         auto n_remaining = [&](uint32_t s) {
-            return (uint32_t) (seq_set_map[cur_seq_set[s]].size() - cur_idx[s]);
+            // inkling2_loop (S32): only the trailing tokens that run at this depth belong to this ubatch
+            uint32_t n = 0;
+            const auto & seq_idxs = seq_set_map[cur_seq_set[s]];
+            while (cur_idx[s] + n < (uint32_t) seq_idxs.size() &&
+                    entry_n_passes(seq_idxs[cur_idx[s] + n]) == n_passes_cur) {
+                ++n;
+            }
+            return n;
         };
 
         // keep the longest prefix of seqs that satisfy the constraint, to preserve sequential seq ids
@@ -834,9 +881,12 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 }
 
 llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
-    // find the first unused token
+    // inkling2_loop (S32): 1 ubatch = 1 depth
+    const uint32_t n_passes_cur = split_n_passes();
+
+    // find the first unused token of the current depth
     uint32_t cur_idx = 0;
-    while (cur_idx < used.size() && used[cur_idx]) {
+    while (cur_idx < used.size() && split_skip(cur_idx, n_passes_cur)) {
         ++cur_idx;
     }
 
@@ -863,7 +913,7 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
 
         do {
             ++cur_idx;
-        } while (cur_idx < get_n_tokens() && (used[cur_idx] || ((cur_seq_set & seq_set[cur_idx]) != seq_set[cur_idx])));
+        } while (cur_idx < get_n_tokens() && (split_skip(cur_idx, n_passes_cur) || ((cur_seq_set & seq_set[cur_idx]) != seq_set[cur_idx])));
 
         if (cur_idx == get_n_tokens()) {
             break;
@@ -894,6 +944,7 @@ void llama_batch_allocr::clear() {
     output      .clear();
     decision_order.clear();
     decision_group.clear();
+    n_passes   .clear();
 
     for (auto & cur : seq_pos) {
         cur.clear();
@@ -951,6 +1002,19 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->type      .resize(mixed ? n_tokens : 0);
     udata->decision_order.resize(decision_order.empty() ? 0 : n_tokens);
     udata->decision_group.resize(decision_group.empty() ? 0 : n_tokens);
+
+    // inkling2_loop: 1 ubatch = 1 graph = 1 depth, so the ubatch takes the depth of its first entry
+    //   (0 = the context default). the split already groups by effective depth, so this is only a guard.
+    uint32_t n_passes_ub = n_passes.empty() ? 0 : n_passes[idxs[0]];
+    if (!n_passes.empty()) {
+        for (size_t i = 1; i < idxs.size(); ++i) {
+            if (entry_n_passes(idxs[i]) != entry_n_passes(idxs[0])) {
+                LLAMA_LOG_WARN("%s: entries with different n_passes in one ubatch, using %u (first entry)\n",
+                        __func__, n_passes_ub);
+                break;
+            }
+        }
+    }
 
     udata->batch_idxs = idxs;
     udata->seq_id_data.reserve(n_tokens);
@@ -1042,6 +1106,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.type         =*/ mixed ? udata->type.data() : nullptr,
         /*.decision_order =*/ udata->decision_order.empty() ? nullptr : udata->decision_order.data(),
         /*.decision_group =*/ udata->decision_group.empty() ? nullptr : udata->decision_group.data(),
+        /*.n_passes     =*/ n_passes_ub,
         /*.data         =*/ std::move(udata),
     };
 
@@ -1450,6 +1515,14 @@ bool llama_batch_ext::set_decision_group(int32_t idx, int32_t group) {
     return true;
 }
 
+bool llama_batch_ext::set_loop_passes(int32_t idx, uint32_t n_passes) {
+    if (idx < 0 || idx >= (int32_t) tokens.size()) {
+        return false;
+    }
+    tokens[idx].n_passes = n_passes;
+    return true;
+}
+
 // llama_batch_ext C API
 
 llama_batch_ext * llama_batch_ext_init(llama_context * ctx) {
@@ -1535,6 +1608,10 @@ bool llama_batch_ext_set_decision_order(llama_batch_ext * batch, int32_t idx, ll
 
 bool llama_batch_ext_set_decision_group(llama_batch_ext * batch, int32_t idx, int32_t group) {
     return batch->set_decision_group(idx, group);
+}
+
+bool llama_batch_ext_set_loop_passes(llama_batch_ext * batch, int32_t idx, uint32_t n_passes) {
+    return batch->set_loop_passes(idx, n_passes);
 }
 
 // llama_batch_compat

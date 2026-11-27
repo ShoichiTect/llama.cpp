@@ -70,6 +70,14 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Min chunk size to attempt reusing from the cache via KV shifting. See --cache-reuse arg"));
 
+    add((new field_num("loop_passes", params.n_loop_passes))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("inkling2_loop: number of passes over the looped core for the generated tokens of this request (0 = server default). The prompt is still processed at the context depth (--loop-passes), i.e. a lower value makes only the decode shallower and faster, without repairing any KV"));
+
+    add((new field_num("loop_passes_prompt", params.n_loop_passes_prompt))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("inkling2_loop: P5 - number of passes for the prompt (history) tokens of this request (0 = context depth, --loop-passes). A lower value makes the history shallow; the dropped pass slots stay neutral (no repair), so the decode still runs at the context depth"));
+
     // TODO: implement t_max_prompt_ms
     // add((new field_num("t_max_prompt_ms", params.t_max_prompt_ms))
 

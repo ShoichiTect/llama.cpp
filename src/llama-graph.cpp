@@ -278,6 +278,22 @@ bool llm_graph_input_batch_idxs::can_reuse(const llm_graph_params & params) {
     return idxs->ne[0] == params.ubatch.n_tokens;
 }
 
+void llm_graph_input_bank_pos::set_input(const llama_ubatch * ubatch) {
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    GGML_ASSERT(ubatch->pos || ubatch->data || n_tokens == 0);
+    GGML_ASSERT(ggml_backend_buffer_is_host(pos->buffer));
+
+    int32_t * data = (int32_t *) pos->data;
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        data[i] = ubatch->pos[i];
+    }
+}
+
+bool llm_graph_input_bank_pos::can_reuse(const llm_graph_params & params) {
+    return pos->ne[0] == params.ubatch.n_tokens;
+}
+
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;

@@ -91,6 +91,16 @@ struct task_params {
 
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
 
+    // inkling2_loop: number of passes over the looped core for the generated tokens of this request
+    //   (0 = server default). the prompt is always processed at the context depth, so a request can
+    //   ask for a shallower decode without touching the KV slots the prompt wrote
+    int32_t n_loop_passes = 0;
+
+    // inkling2_loop: P5 - number of passes for the *prompt* entries of this request (0 = context
+    //   default). a lower value makes the history shallow and leaves the dropped pass slots at the
+    //   neutral state written by the engine (no repair), so the deeper decode reads them as zero
+    int32_t n_loop_passes_prompt = 0;
+
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 

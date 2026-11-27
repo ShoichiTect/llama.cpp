@@ -137,6 +137,8 @@ public:
 
     bool get_can_shift() const override;
 
+    void set_allow_replay(bool value) override { allow_replay = value; }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -212,6 +214,12 @@ public:
     ggml_tensor * get_k_scale(int32_t il) const;
     ggml_tensor * get_v_scale(int32_t il) const;
 
+    // inkling2_loop (V08): copy the K/V rows of the cells that hold the positions [p0, p1) of a sequence
+    //   from layer il_src to layer il_dst. the rows are moved through the host, so the caches may be
+    //   offloaded. returns false if this cache does not hold both layers (the caller tries the other
+    //   cache of an iSWA pair). only the non-transposed (flash attention) V layout is supported.
+    bool copy_kv_rows(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int32_t il_src, int32_t il_dst);
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
@@ -230,6 +238,9 @@ public:
     // if cont == true, then the slot must be continuous
     // return empty slot_info on failure
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
+
+    // inkling2_loop (S28): reuse the cells that already hold the positions of the ubatch (bank replay)
+    bool allow_replay = false;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);

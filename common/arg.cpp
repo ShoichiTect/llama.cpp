@@ -1638,6 +1638,65 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LOOP_PASSES"));
     add_opt(common_arg(
+        { "--loop-passes-decode" }, "N",
+        "inkling2_loop: number of passes for the generation (1 token per seq) phase, i.e. mixed depth.\n"
+        "the prompt is still processed with --loop-passes. (default: 0 = same as --loop-passes)",
+        [](common_params & params, int value) {
+            params.n_loop_passes_decode = value;
+        }
+    ).set_env("LLAMA_ARG_LOOP_PASSES_DECODE"));
+    add_opt(common_arg(
+        { "--loop-passes-prefix" }, "N",
+        "inkling2_loop: number of passes for the prefix segment (P5: shallow prefix, deeper continuation).\n"
+        "the rest of the context is processed with --loop-passes-decode / --loop-passes.\n"
+        "(default: 0 = same as --loop-passes)",
+        [](common_params & params, int value) {
+            params.n_loop_passes_prefix = value;
+        }
+    ).set_env("LLAMA_ARG_LOOP_PASSES_PREFIX"));
+    add_opt(common_arg(
+        { "--ppl-prefix" }, "N",
+        "perplexity: number of tokens prefilled as the prefix; the ppl covers the continuation after it.\n"
+        "use with --loop-passes-prefix / --loop-passes-decode for P5 (default: 0 = n_ctx/2)",
+        [](common_params & params, int value) {
+            params.ppl_prefix_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_PPL_PREFIX"));
+    add_opt(common_arg(
+        { "--loop-passes-ubatch" }, "N",
+        "inkling2_loop: carry the number of passes over the looped core on the batch entries, so that each\n"
+        "ubatch uses the depth of its first entry (default: 0 = disabled, the context depth is used).\n"
+        "a uniform N must produce the same result as --loop-passes N",
+        [](common_params & params, int value) {
+            params.n_loop_passes_ubatch = value;
+        }
+    ).set_env("LLAMA_ARG_LOOP_PASSES_UBATCH"));
+    add_opt(common_arg(
+        { "--loop-passes-repair" }, "N",
+        "inkling2_loop: raise the prefix from --loop-passes-prefix to the decode depth by recomputing it\n"
+        "(S25: seq_rm + a batch prefill of the interval, instead of the no-repair switch). 1 = on, 0 = off",
+        [](common_params & params, int value) {
+            params.n_loop_passes_repair = value;
+        }
+    ).set_env("LLAMA_ARG_LOOP_PASSES_REPAIR"));
+    add_opt(common_arg(
+        { "--loop-inject" }, "N",
+        "inkling2_loop (V08): after the prefix prefill, copy the K/V rows of the deepest prefix pass into\n"
+        "the deepest decode pass for the prefix positions, so that its attention reads the deeper pass.\n"
+        "new positions keep writing to the decode pass's own slot. 1 = on, 0 = off",
+        [](common_params & params, int value) {
+            params.loop_inject = value;
+        }
+    ).set_env("LLAMA_ARG_LOOP_INJECT"));
+    add_opt(common_arg(
+        { "--ppl-repair-p0" }, "N",
+        "perplexity: first position of the interval that --loop-passes-repair recomputes (default: 0).\n"
+        "a value > 0 only repairs the tail - the deeper pass slots before it cannot be rebuilt",
+        [](common_params & params, int value) {
+            params.ppl_repair_p0 = value;
+        }
+    ).set_env("LLAMA_ARG_PPL_REPAIR_P0"));
+    add_opt(common_arg(
         { "--kv-unified-per-slot" }, "N",
         "context limit per parallel slot (default: unset, behavior unchanged).\n"
         "when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N",

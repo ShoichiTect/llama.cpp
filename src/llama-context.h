@@ -20,6 +20,8 @@ struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
 
+struct llama_bank;
+
 class llama_io_read_i;
 class llama_io_write_i;
 
@@ -138,6 +140,28 @@ struct llama_context {
     bool supports_state_row() const;
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
+
+    // inkling2_loop: per-phase depth (prefill vs decode). 0 restores the context default.
+    void     set_loop_passes(uint32_t n_passes);
+    uint32_t get_loop_passes() const;
+
+    // inkling2_loop (V08): copy the K/V of the loop core from pass slot pass_src to pass_dst over the
+    //   positions [p0, p1) of a sequence. returns the number of layers copied, or -1 on failure.
+    int32_t loop_copy_pass_kv(uint32_t pass_src, uint32_t pass_dst, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+
+    // inkling2_loop (S25): raise the depth of a sequence and recompute the interval [p0, p1) with it.    //   `tokens` is indexed by absolute position (it must cover at least [0, p1)). returns the number
+    //   of recomputed tokens, or -1 on failure.
+    int32_t loop_recompute(uint32_t n_passes, llama_seq_id seq_id, const llama_token * tokens, llama_pos p0, llama_pos p1);
+
+    // inkling2_loop (S28): the activation bank of the loop core.
+    //   bank_create() allocates it for the positions [0, n_cap) on the output device.
+    //   bank_write(true) makes the next decodes store what the next pass would consume; a raise with
+    //   loop_raise_bank() replays the deepest pass over [0, p1) from the bank instead of recomputing
+    //   the shallow passes.
+    llama_bank * bank_create(uint32_t n_cap, ggml_type type);
+    void        bank_write(bool value);
+    void        bank_set_mode(uint32_t mode);
+    int32_t     loop_raise_bank(uint32_t n_passes, llama_seq_id seq_id, const llama_token * tokens, llama_pos p0, llama_pos p1, uint32_t graph_mode = 2);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -337,6 +361,14 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+
+    uint32_t n_passes_default = 1; // inkling2_loop: depth the context was created with
+    uint32_t n_passes_log_last = 0; // inkling2_loop (E8): depth of the previous ubatch, for the transition log
+
+    // inkling2_loop (S28): the activation bank of the loop core, and what the graphs do with it.
+    //   the bank is owned by the caller of llama_bank_init() - free it before the context
+    llama_bank * bank = nullptr;
+    uint32_t     bank_mode = 0; // 0 off, 1 write, 2 read
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

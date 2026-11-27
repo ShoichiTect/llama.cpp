@@ -132,6 +132,17 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // inkling2_loop (S28): a bank replay re-feeds positions that the cache already holds, so the KV
+    //   cache must reuse their cells instead of allocating new ones. the other memories (the
+    //   recurrent state is per sequence) do not need a special case.
+    virtual void set_allow_replay(bool /*value*/) {}
+
+    // inkling2_loop (V08): copy the K/V of the loop core from one pass slot to another for the
+    //   positions [p0, p1) of a sequence. returns the number of layers copied, or -1 if the memory
+    //   has no loop core. new positions keep writing to the destination pass slot.
+    virtual int32_t copy_loop_pass_kv(uint32_t /*pass_src*/, uint32_t /*pass_dst*/, llama_seq_id /*seq_id*/,
+            llama_pos /*p0*/, llama_pos /*p1*/) { return -1; }
+
     //
     // ops
     //

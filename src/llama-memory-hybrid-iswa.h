@@ -59,6 +59,14 @@ public:
 
     bool get_can_shift() const override;
 
+    void set_allow_replay(bool value) override;
+
+    // inkling2_loop (V08): copy the K/V of the loop core from pass slot `pass_src` to `pass_dst`
+    //   over the positions [p0, p1) of a sequence (0-based pass indices). returns the layer count.
+    int32_t copy_loop_pass_kv(uint32_t pass_src, uint32_t pass_dst, llama_seq_id seq_id,
+            llama_pos p0, llama_pos p1) override;
+
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

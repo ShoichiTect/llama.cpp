@@ -1098,6 +1098,15 @@ extern "C" {
 
     // TODO: implement get_embeddings() and get_logits() for llama_batch_ext
 
+    // inkling2_loop: set the number of passes over the looped core for the entry at index idx (0 = context default).
+    //   the depth is a property of the ubatch: an ubatch uses the depth of its first entry, so all entries
+    //   that land in the same ubatch must agree. values deeper than the context default are clamped to it,
+    //   because the KV slots were sized for the depth the context was created with.
+    LLAMA_API bool llama_batch_ext_set_loop_passes(
+                                struct llama_batch_ext * batch,
+                                               int32_t   idx,
+                                              uint32_t   n_passes);
+
     // Return values are the same as llama_decode()
     LLAMA_API int32_t llama_process(
                                 struct llama_context * ctx,
@@ -1108,6 +1117,97 @@ extern "C" {
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
     LLAMA_API void llama_set_n_threads(struct llama_context * ctx, int32_t n_threads, int32_t n_threads_batch);
+
+    // inkling2_loop: change the number of passes over the looped core at runtime (0 = the context default).
+    //   clamped to the model default; the KV slots of the dropped passes are left as they are (no repair)
+    LLAMA_API void     llama_set_loop_passes(struct llama_context * ctx, uint32_t n_passes);
+    LLAMA_API uint32_t llama_get_loop_passes(const struct llama_context * ctx);
+
+    // inkling2_loop (V08): copy the K/V of the loop core from one pass slot to another for the
+    //   positions [p0, p1) of a sequence (0-based pass indices). the attention of the destination pass
+    //   then reads what the source pass wrote for those positions, while new positions keep writing to
+    //   the destination slot. only the looped core layers are touched. the rows go through the host, so
+    //   the caches may be offloaded. returns the number of layers copied, or -1 on failure.
+    LLAMA_API int32_t llama_loop_copy_pass_kv(
+                                struct llama_context * ctx,
+                                             uint32_t   pass_src,
+                                             uint32_t   pass_dst,
+                                           llama_seq_id   seq_id,
+                                            llama_pos     p0,
+                                            llama_pos     p1);
+
+    // inkling2_loop (S25): raise (or lower) the depth of a sequence and recompute the interval [p0, p1)
+    //   with the new depth - the full-recompute repair. the KV/conv state of the interval is dropped
+    //   (seq_rm) and `tokens[p0 .. p1)` is fed again as a batch prefill (`tokens` is indexed by absolute
+    //   position, so it must cover [0, p1)). p0 == 0 restores the state of a uniform deep run; a p0 > 0
+    //   only repairs the tail unless the memory can cut the sequence there (a recurrent state usually
+    //   cannot, and the whole series is recomputed instead).
+    //   returns the number of recomputed tokens, or -1 on failure.
+    LLAMA_API int32_t llama_loop_recompute(
+                                struct llama_context * ctx,
+                                             uint32_t   n_passes,
+                                           llama_seq_id   seq_id,
+                                     const llama_token *  tokens,
+                                            llama_pos     p0,
+                                            llama_pos     p1);
+
+    // inkling2_loop (S28): the activation bank of the loop core.
+    //
+    //   the looped core stores, per token, the tensors the next pass would consume (its input, the
+    //   cross-depth blocks and the output of the pass below). writing them costs `n_slot` rows of
+    //   `n_embd` values per token; a raise then replays the deepest pass alone over the interval
+    //   instead of re-running the shallow passes (see llama_loop_raise_bank()).
+    struct llama_bank;
+
+    // allocate a bank for the positions [0, n_cap) on the model output device. type is the storage
+    //   type of the rows (GGML_TYPE_F32 keeps the activations exact, GGML_TYPE_F16 halves the size).
+    LLAMA_API struct llama_bank * llama_bank_init(
+                                struct llama_context * ctx,
+                                             uint32_t   n_cap,
+                                          enum ggml_type   type);
+
+    LLAMA_API void     llama_bank_free            (struct llama_bank * bank);
+    LLAMA_API size_t   llama_bank_size            (const struct llama_bank * bank);
+    LLAMA_API size_t   llama_bank_bytes_per_token (const struct llama_bank * bank);
+    LLAMA_API uint32_t llama_bank_n_slot          (const struct llama_bank * bank);
+
+    // read `n_pos` rows of a slot into a float buffer (F16 rows are widened exactly), for inspection
+    LLAMA_API size_t llama_bank_get(
+                              const struct llama_bank * bank,
+                                             uint32_t   slot,
+                                            llama_pos   pos0,
+                                            llama_pos   n_pos,
+                                                float * out);
+
+    // store (value = true) what the next pass would consume on every following decode, or stop storing
+    LLAMA_API void llama_bank_set_write(struct llama_context * ctx, bool value);
+
+    // graph mode of the store: 1 = what the next pass would consume (default), 4 = what the current
+    //   deepest pass consumes (debug: lets a depth-3 run store exactly the tensors it feeds the deep pass)
+    LLAMA_API void llama_bank_set_mode(struct llama_context * ctx, uint32_t mode);
+
+    // inkling2_loop (S28): raise the depth of the sequence by one pass and replay the deepest pass
+    //   over the interval [p0, p1) from the bank (`tokens` is indexed by absolute position, so it must
+    //   cover [0, p1)). the KV slots of the passes below are left as they are, so this needs a bank
+    //   written by a run at the current depth. returns the number of replayed tokens, or -1 on failure.
+    // the same, but with an explicit graph mode: 2 replays the deepest pass alone, 3 also builds the
+    //   passes below (only for checking the bank data against the in-graph values)
+    LLAMA_API int32_t llama_loop_raise_bank_mode(
+                                struct llama_context * ctx,
+                                             uint32_t   n_passes,
+                                           llama_seq_id   seq_id,
+                                     const llama_token *  tokens,
+                                            llama_pos     p0,
+                                            llama_pos     p1,
+                                             uint32_t   mode);
+
+    LLAMA_API int32_t llama_loop_raise_bank(
+                                struct llama_context * ctx,
+                                             uint32_t   n_passes,
+                                           llama_seq_id   seq_id,
+                                     const llama_token *  tokens,
+                                            llama_pos     p0,
+                                            llama_pos     p1);
 
     // Get the number of threads used for generation of a single token.
     LLAMA_API int32_t llama_n_threads(struct llama_context * ctx);

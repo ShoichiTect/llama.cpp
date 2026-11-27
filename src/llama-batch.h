@@ -62,6 +62,7 @@ struct llama_ubatch {
     int8_t       *  type;       // [n_tokens]         | i   | -     (mixed ubatch only, 0 - token, 1 - embd)
     int32_t      *  decision_order; // [n_tokens], NULL if no entry has one, see llama_batch_ext_set_decision_order()
     int32_t      *  decision_group; // [n_tokens], NULL if no entry has one, see llama_batch_ext_set_decision_group()
+    uint32_t        n_passes;       // inkling2_loop: passes over the looped core for this ubatch, 0 = context default
 
     struct data_t {
         std::vector<llama_token>    token;
@@ -124,6 +125,7 @@ struct llama_batch_ext {
         bool         output = false; // TODO: have dedicated output flags
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
         int32_t      decision_group = 0; // see llama_batch_ext_set_decision_group()
+        uint32_t     n_passes       = 0; // see llama_batch_ext_set_loop_passes()
         std::unordered_set<llama_seq_id> seq_ids;
         std::array<llama_pos, GGML_MROPE_SECTIONS> pos = {0, 0, 0, 0};
     };
@@ -159,6 +161,7 @@ struct llama_batch_ext {
     bool set_output(int32_t idx, bool output_last);
     bool set_decision_order(int32_t idx, int32_t order);
     bool set_decision_group(int32_t idx, int32_t group);
+    bool set_loop_passes(int32_t idx, uint32_t n_passes);
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch
@@ -187,6 +190,14 @@ public:
 
     // call once before splitting the batch to reset the internal state
     void split_reset();
+
+    // inkling2_loop (S28): accept positions that are already in the memory (a bank replay re-feeds an
+    //   interval of a sequence instead of appending to it)
+    void set_allow_replay(bool value) { allow_replay = value; }
+
+    // inkling2_loop (S32): the depth that an entry without an explicit n_passes runs at (the context
+    //   default). used only to group the splits by effective depth - 1 ubatch = 1 depth
+    void set_default_n_passes(uint32_t value) { n_passes_default = value; }
 
     // simple split, unknown number of sequence sets of unequal lengths
     llama_ubatch split_simple(uint32_t n_ubatch);
@@ -224,6 +235,31 @@ private:
     const uint32_t n_pos_per_embd;
 
     const bool allow_mixed;
+    bool allow_replay = false;
+    uint32_t n_passes_default = 0; // 0 = no grouping (every entry has the same depth)
+
+    // inkling2_loop (S32): the effective depth of entry i (0 in n_passes means the context default)
+    uint32_t entry_n_passes(int32_t i) const {
+        if (n_passes.empty()) {
+            return n_passes_default;
+        }
+        return n_passes[i] != 0 ? n_passes[i] : n_passes_default;
+    }
+
+    // the depth of the next entry that the split will take
+    uint32_t split_n_passes() const {
+        for (size_t i = 0; i < used.size(); ++i) {
+            if (!used[i]) {
+                return entry_n_passes((int32_t) i);
+            }
+        }
+        return 0;
+    }
+
+    // an entry is unavailable for the current split if it was used already or if it runs at another depth
+    bool split_skip(int32_t i, uint32_t n_passes_cur) const {
+        return used[i] || entry_n_passes(i) != n_passes_cur;
+    }
 
     uint32_t n_embd;
     uint32_t n_embd_state;
@@ -246,6 +282,7 @@ private:
     std::vector<int8_t>         output;
     std::vector<int32_t>        decision_order; // empty if no entry has one
     std::vector<int32_t>        decision_group; // empty if no entry has one
+    std::vector<uint32_t>       n_passes;        // empty if no entry has one
 
     using pos_set_t = std::set<llama_pos>;
     using seq_cpl_t = std::vector<bool>;

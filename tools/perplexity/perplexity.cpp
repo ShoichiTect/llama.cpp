@@ -539,6 +539,32 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     // process the entire prompt.
     const int first = n_ctx/2;
 
+    // mixed depth (--loop-passes-decode / --loop-passes-prefix): the prefix is prefilled in one batch with
+    //   the prefix depth and the continuation is fed one token at a time with the decode depth. the ppl
+    //   covers the same tokens as the stock path (the last n_ctx - prefix_n - 1 of each chunk), so
+    //   all-d3 / all-d2 / mixed compare. --ppl-prefix moves the boundary (P5: segment length 100/500/2000).
+    const bool cont_mode = params.n_loop_passes_decode > 0 || params.n_loop_passes_prefix > 0 ||
+                           params.ppl_prefix_tokens > 0 || params.n_loop_passes_repair > 0;
+    const int prefix_n = params.ppl_prefix_tokens > 0 ? params.ppl_prefix_tokens : first;
+    if (cont_mode && n_seq != 1) {
+        LOG_ERR("%s: --loop-passes-decode needs n_batch == n_ctx, got n_batch = %d, n_ctx = %d\n", __func__, n_batch, n_ctx);
+        return {tokens, 0., {}, {}};
+    }
+    if (cont_mode && !params.logits_file.empty()) {
+        LOG_ERR("%s: --loop-passes-decode is not supported with --logits-file\n", __func__);
+        return {tokens, 0., {}, {}};
+    }
+    if (cont_mode && (prefix_n <= 0 || prefix_n >= n_ctx - 1)) {
+        LOG_ERR("%s: --ppl-prefix must be in [1, n_ctx - 2], got %d (n_ctx = %d)\n", __func__, prefix_n, n_ctx);
+        return {tokens, 0., {}, {}};
+    }
+
+    // depth of each segment (0 = context default)
+    const uint32_t n_passes_prefill = (uint32_t) (params.n_loop_passes_prefix > 0 ? params.n_loop_passes_prefix :
+                                                 (params.n_loop_passes > 0 ? params.n_loop_passes : 0));
+    const uint32_t n_passes_decode  = (uint32_t) (params.n_loop_passes_decode > 0 ? params.n_loop_passes_decode :
+                                                 (params.n_loop_passes > 0 ? params.n_loop_passes : 0));
+
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
         const int end   = start + n_ctx;
@@ -549,6 +575,139 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
         // clear the KV cache
         llama_memory_clear(llama_get_memory(ctx), true);
+
+        if (cont_mode) {
+            // 1) prefill the prefix with the prefill depth
+            llama_set_loop_passes(ctx, n_passes_prefill);
+            const uint32_t n_passes_prefill_eff = llama_get_loop_passes(ctx);
+
+            batch.clear();
+            {
+                const auto token_org = tokens[start];
+                if (add_bos) {
+                    tokens[start] = llama_vocab_bos(vocab);
+                }
+                for (int k = 0; k < prefix_n; ++k) {
+                    batch.add(tokens[start + k], k, 0, false);
+                }
+                tokens[start] = token_org;
+            }
+
+            // S26: the prefix prefill is the d3 prefill cost that S05 measured as a proxy (same binary/flags).
+            const auto t_pre0 = std::chrono::high_resolution_clock::now();
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+                LOG_ERR("%s : failed to decode\n", __func__);
+                return {tokens, -1, logit_history, prob_history};
+            }
+            llama_synchronize(ctx);
+            const float t_pre = std::chrono::duration<float>(
+                    std::chrono::high_resolution_clock::now() - t_pre0).count();
+            LOG_INF("%s: prefix prefill %d tokens at depth %u in %.3f s (%.1f t/s)\n",
+                    __func__, prefix_n, n_passes_prefill_eff, t_pre, t_pre > 0 ? prefix_n / t_pre : 0.0f);
+
+            // 2) continuation, one token per decode with the decode depth
+            llama_set_loop_passes(ctx, n_passes_decode);
+            const uint32_t n_passes_decode_eff = llama_get_loop_passes(ctx);
+
+            // 2'') V08: pass-slot substitution. the prefix ran at the prefill depth and wrote the K/V of
+            //   its deepest pass; copy those rows over the deepest pass of the decode depth, so its
+            //   attention reads the deeper representation for the prefix. the loop copies only the
+            //   existing cells [0, prefix_n) - the continuation writes its own cells to the pass slot.
+            if (params.loop_inject > 0) {
+                if (n_passes_prefill_eff < 2 || n_passes_decode_eff < 2) {
+                    LOG_ERR("%s: --loop-inject needs at least 2 passes for the prefix and the decode (%u, %u)\n",
+                            __func__, n_passes_prefill_eff, n_passes_decode_eff);
+                    return {tokens, -1, logit_history, prob_history};
+                }
+                const auto t_inj0 = std::chrono::high_resolution_clock::now();
+                const int32_t n_inj = llama_loop_copy_pass_kv(ctx,
+                        n_passes_prefill_eff - 1, n_passes_decode_eff - 1, 0, 0, prefix_n);
+                const float t_inj = std::chrono::duration<float>(
+                        std::chrono::high_resolution_clock::now() - t_inj0).count();
+                if (n_inj < 0) {
+                    LOG_ERR("%s: pass-slot substitution failed\n", __func__);
+                    return {tokens, -1, logit_history, prob_history};
+                }
+                LOG_INF("%s: injected pass %u -> %u over %d prefix positions (%d layers) in %.3f s\n",
+                        __func__, n_passes_prefill_eff - 1, n_passes_decode_eff - 1, prefix_n, n_inj, t_inj);
+            }
+
+            // 2') S25: raise with a full recompute (seq_rm + re-decode of the interval) instead of the
+            //   no-repair switch. a prefix of 0 means "recompute everything before the continuation",
+            //   which is exactly the interval that ran shallow, so the continuation must reproduce all-d3.
+            if (params.n_loop_passes_repair > 0) {
+                const auto token_org = tokens[start];
+                if (add_bos) {
+                    tokens[start] = llama_vocab_bos(vocab);
+                }
+                const llama_pos p0 = std::min<llama_pos>(params.ppl_repair_p0 > 0 ? params.ppl_repair_p0 : 0, prefix_n - 1);
+                const auto t_rec0 = std::chrono::high_resolution_clock::now();
+                const int32_t n_rec = llama_loop_recompute(ctx, n_passes_decode, 0, tokens.data() + start, p0, prefix_n);
+                llama_synchronize(ctx);
+                const float t_rec = std::chrono::duration<float>(
+                        std::chrono::high_resolution_clock::now() - t_rec0).count();
+                tokens[start] = token_org;
+                if (n_rec < 0) {
+                    LOG_ERR("%s : raise repair failed\n", __func__);
+                    return {tokens, -1, logit_history, prob_history};
+                }
+                LOG_INF("%s: raise repair recomputed %d tokens at depth %u (prefix ran at %u) in %.3f s (%.1f t/s)\n",
+                        __func__, n_rec, llama_get_loop_passes(ctx), n_passes_prefill_eff, t_rec,
+                        t_rec > 0 ? n_rec / t_rec : 0.0f);
+            }
+
+            std::vector<float> cont_logits;
+            cont_logits.reserve(size_t(n_ctx - prefix_n - 1) * n_vocab);
+            for (int k = prefix_n; k < n_ctx - 1; ++k) {
+                batch.clear();
+                batch.add(tokens[start + k], k, 0, true);
+                if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+                    LOG_ERR("%s : failed to decode\n", __func__);
+                    return {tokens, -1, logit_history, prob_history};
+                }
+                // note: sync - the logits host buffer is reused by the next decode
+                llama_synchronize(ctx);
+                const auto * batch_logits = llama_get_logits(ctx);
+                cont_logits.insert(cont_logits.end(), batch_logits, batch_logits + n_vocab);
+            }
+
+            if (i == 0) {
+                const auto t_end = std::chrono::high_resolution_clock::now();
+                const float t_total = std::chrono::duration<float>(t_end - t_start).count();
+                LOG_INF("%s: %.2f seconds per pass (prefill %d tok @ %u passes, decode %d tok @ %u passes) - ETA ",
+                        __func__, t_total, prefix_n, n_passes_prefill_eff,
+                        n_ctx - prefix_n - 1, n_passes_decode);
+                int total_seconds = (int)(t_total*n_chunk/n_seq);
+                if (total_seconds >= 60*60) {
+                    LOG("%d hours ", total_seconds / (60*60));
+                    total_seconds = total_seconds % (60*60);
+                }
+                LOG("%.2f minutes\n", total_seconds / 60.0);
+            }
+
+            const double nll_prev = nll;
+            process_logits(n_vocab, cont_logits.data(), tokens.data() + start + prefix_n,
+                    n_ctx - 1 - prefix_n, workers, nll, nll2,
+                    logit_history.data() + start + prefix_n,
+                    prob_history.data()  + start + prefix_n);
+            count += n_ctx - prefix_n - 1;
+            // V08: the per-chunk NLL, for the paired comparison of two runs (the printed ppl is cumulative)
+            LOG_INF("%s: chunk %d: nll %.6f over %d tokens (ppl %.6f)\n", __func__, i, nll - nll_prev,
+                    n_ctx - prefix_n - 1, std::exp((nll - nll_prev)/(n_ctx - prefix_n - 1)));
+
+            if (params.ppl_output_type == 0) {
+                LOG("[%d]%.4lf,", i + 1, std::exp(nll / count));
+            } else {
+                double av  = nll/count;
+                double av2 = nll2/count - av*av;
+                if (av2 > 0) {
+                    av2 = sqrt(av2/(count-1));
+                }
+                LOG("%8d  %.4lf  %4lf  %4lf\n", i*n_ctx, std::exp(nll / count), av, av2);
+            }
+
+            continue;
+        }
 
         for (int j = 0; j < num_batches; ++j) {
             const int batch_start = start + j * n_batch;
@@ -577,6 +736,11 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
                 // restore the original token in case it was set to BOS
                 tokens[seq_start] = token_org;
+            }
+
+            // per-ubatch depth: the entries carry the depth and the ubatch splitter picks the first one
+            if (params.n_loop_passes_ubatch > 0) {
+                batch.set_loop_passes((uint32_t) params.n_loop_passes_ubatch);
             }
 
             if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
