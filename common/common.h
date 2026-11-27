@@ -483,6 +483,10 @@ struct common_params {
     int32_t n_parallel            =     1; // number of parallel sequences to decode
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_loop_passes         =     0; // inkling2_loop: passes over the looped core (0 = model default)
+    int32_t n_loop_passes_decode  =     0; // inkling2_loop: passes for the generation phase (0 = same as n_loop_passes)
+    int32_t n_loop_passes_prefix  =     0; // inkling2_loop: passes for the prefix segment of P5 (0 = same as n_loop_passes)
+    int32_t n_loop_passes_ubatch  =     0; // inkling2_loop: passes carried by the ubatch (0 = disabled, tools only)
+    int32_t ppl_prefix_tokens     =     0; // perplexity: prefix tokens before the scored continuation (0 = n_ctx/2)
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
     int32_t grp_attn_n            =     1; // group-attention factor
@@ -1125,6 +1129,7 @@ struct common_batch {
         int32_t      decision_group = 0; // see llama_batch_ext_set_decision_group()
         int32_t      embd_row = -1; // see add_embd_row(), -1 if none
         int32_t      state_row = -1; // see set_embd_state_row(), -1 if none
+        uint32_t     n_passes = 0; // see llama_batch_ext_set_loop_passes()
     };
 
     std::vector<token> tokens; // mirror of the entries, tokens[i] describes batch index i
@@ -1175,6 +1180,9 @@ struct common_batch {
     int32_t add_embd_row(int32_t row, const llama_pos * pos, llama_seq_id seq_id, bool output);
 
     int32_t size() const { return (int32_t) tokens.size(); }
+
+    // inkling2_loop: set the depth carried by every entry of the batch (0 = context default)
+    void set_loop_passes(uint32_t n_passes);
 };
 
 // create a single-sequence batch from a list of tokens

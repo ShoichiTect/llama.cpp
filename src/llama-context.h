@@ -139,6 +139,10 @@ struct llama_context {
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
 
+    // inkling2_loop: per-phase depth (prefill vs decode). 0 restores the context default.
+    void     set_loop_passes(uint32_t n_passes);
+    uint32_t get_loop_passes() const;
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -337,6 +341,9 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+
+    uint32_t n_passes_default = 1; // inkling2_loop: depth the context was created with
+    uint32_t n_passes_log_last = 0; // inkling2_loop (E8): depth of the previous ubatch, for the transition log
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

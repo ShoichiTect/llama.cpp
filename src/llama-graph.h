@@ -973,6 +973,11 @@ struct llm_graph_params {
             return false;
         }
 
+        // inkling2_loop: the number of passes changes the graph topology (and which KV slots are touched)
+        if (cparams.n_passes != other.cparams.n_passes) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&

@@ -1,4 +1,6 @@
 #include "models.h"
+#include "../llama-kv-cache-iswa.h"
+#include "../llama-memory-recurrent.h"
 
 int llama_model_inkling2_loop::layer_phys(int il) const {
     return il < n_phys ? il : core_start + (il - n_phys) % (core_end - core_start);
@@ -114,6 +116,52 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
             }
             const auto & loop = m.loop_layers[ip - start];
             cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query), &loop);
+        }
+    }
+
+    // no repair: this graph only runs the slots of the first `n_passes` passes. a cell of a
+    // remaining pass slot at a position of this ubatch would otherwise keep the K/V of an earlier
+    // run (another sequence, or the same sequence at a deeper depth) and the shared KQ mask would
+    // treat it as valid. reset those cells to the neutral value a fresh cache has, so the positions
+    // stay usable when the depth is raised later on but carry no content of another series.
+    for (uint32_t pass = n_passes; pass < params.cparams.n_passes_max; ++pass) {
+        for (int ip = start; ip < end; ++ip) {
+            const int il = m.n_phys + (pass - 1)*(end - start) + (ip - start);
+
+            const bool is_swa = hparams.is_swa(il);
+
+            const llama_kv_cache_context * kvctx = is_swa ? attn->mctx->get_swa() : attn->mctx->get_base();
+            ggml_tensor * k_idxs = is_swa ? attn->get_k_idxs_swa() : attn->get_k_idxs();
+            ggml_tensor * v_idxs = is_swa ? attn->get_v_idxs_swa() : attn->get_v_idxs();
+            if (!k_idxs || !v_idxs) {
+                continue;
+            }
+
+            const int64_t n_embd_head = hparams.n_embd_head_k(il);
+            const int64_t n_head_kv   = hparams.n_head_kv(il);
+            const int64_t n_tok       = ubatch.n_tokens;
+
+            ggml_tensor * zero_k = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd_head, n_head_kv, n_tok), 0.0f);
+            ggml_tensor * zero_v = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd_head, n_head_kv, n_tok), 0.0f);
+            ggml_set_name(zero_k, "inkling2_nopass_k");
+            ggml_set_name(zero_v, "inkling2_nopass_v");
+
+            ggml_build_forward_expand(gf, kvctx->cpy_k(ctx0, zero_k, k_idxs, il));
+            ggml_build_forward_expand(gf, kvctx->cpy_v(ctx0, zero_v, v_idxs, il));
+
+            // the conv/recurrent state of the slot must not keep the history of an earlier series
+            // either: the next pass slot resumes from the state written at this cell
+            ggml_tensor * r = recr->mctx->get_r_l(il);
+            if (r) {
+                const size_t row = r->nb[1];
+                const size_t off = (size_t) recr->mctx->get_head()*row;
+                if (off + ubatch.n_seqs*row <= ggml_nbytes(r)) {
+                    ggml_tensor * cell = ggml_view_2d(ctx0, r, hparams.n_embd_r(), ubatch.n_seqs, row, off);
+                    ggml_tensor * zero_r = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_r(), ubatch.n_seqs), 0.0f);
+                    ggml_set_name(zero_r, "inkling2_nopass_r");
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, zero_r, cell));
+                }
+            }
         }
     }
 

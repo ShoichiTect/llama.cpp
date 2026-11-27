@@ -1638,6 +1638,40 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LOOP_PASSES"));
     add_opt(common_arg(
+        { "--loop-passes-decode" }, "N",
+        "inkling2_loop: number of passes for the generation (1 token per seq) phase, i.e. mixed depth.\n"
+        "the prompt is still processed with --loop-passes. (default: 0 = same as --loop-passes)",
+        [](common_params & params, int value) {
+            params.n_loop_passes_decode = value;
+        }
+    ).set_env("LLAMA_ARG_LOOP_PASSES_DECODE"));
+    add_opt(common_arg(
+        { "--loop-passes-prefix" }, "N",
+        "inkling2_loop: number of passes for the prefix segment (P5: shallow prefix, deeper continuation).\n"
+        "the rest of the context is processed with --loop-passes-decode / --loop-passes.\n"
+        "(default: 0 = same as --loop-passes)",
+        [](common_params & params, int value) {
+            params.n_loop_passes_prefix = value;
+        }
+    ).set_env("LLAMA_ARG_LOOP_PASSES_PREFIX"));
+    add_opt(common_arg(
+        { "--ppl-prefix" }, "N",
+        "perplexity: number of tokens prefilled as the prefix; the ppl covers the continuation after it.\n"
+        "use with --loop-passes-prefix / --loop-passes-decode for P5 (default: 0 = n_ctx/2)",
+        [](common_params & params, int value) {
+            params.ppl_prefix_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_PPL_PREFIX"));
+    add_opt(common_arg(
+        { "--loop-passes-ubatch" }, "N",
+        "inkling2_loop: carry the number of passes over the looped core on the batch entries, so that each\n"
+        "ubatch uses the depth of its first entry (default: 0 = disabled, the context depth is used).\n"
+        "a uniform N must produce the same result as --loop-passes N",
+        [](common_params & params, int value) {
+            params.n_loop_passes_ubatch = value;
+        }
+    ).set_env("LLAMA_ARG_LOOP_PASSES_UBATCH"));
+    add_opt(common_arg(
         { "--kv-unified-per-slot" }, "N",
         "context limit per parallel slot (default: unset, behavior unchanged).\n"
         "when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N",

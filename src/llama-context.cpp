@@ -207,6 +207,8 @@ llama_context::llama_context(
                 __func__, params.n_loop_passes, hparams.n_loop_passes);
     }
     cparams.n_layer_use = hparams.n_layer_use(cparams.n_passes);
+    cparams.n_passes_max = cparams.n_passes;
+    n_passes_default    = cparams.n_passes;
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
@@ -1439,6 +1441,37 @@ void llama_context::set_embeddings(bool value) {
     cparams.embeddings = value;
 }
 
+void llama_context::set_loop_passes(uint32_t n_passes) {
+    const auto & hparams = model.hparams;
+    if (hparams.n_loop_phys == 0) {
+        return; // not a looped model
+    }
+
+    uint32_t n = n_passes > 0 ? n_passes : n_passes_default;
+    if (n > hparams.n_loop_passes) {
+        n = hparams.n_loop_passes;
+    }
+    // the context only owns the KV slots of the depth it was created with (see cparams.n_passes_max)
+    if (n > cparams.n_passes_max) {
+        n = cparams.n_passes_max;
+    }
+    if (n < 1) {
+        n = 1;
+    }
+    if (n == cparams.n_passes) {
+        return;
+    }
+
+    // a different depth is a different graph, and the KV slots of the dropped passes are not repaired
+    LLAMA_LOG_DEBUG("%s: n_passes %u -> %u\n", __func__, cparams.n_passes, n);
+    cparams.n_passes    = n;
+    sched_need_reserve  = true;
+}
+
+uint32_t llama_context::get_loop_passes() const {
+    return cparams.n_passes;
+}
+
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
@@ -2372,8 +2405,38 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ggml_backend_event_wait(h_nextn_backend, ev_h_nextn_read.get());
     }
 
+    // inkling2_loop (E8): observability for the per-ubatch depth. the interesting case is a mixed-depth
+    //   request (e.g. prompt at d3 and generation at d2): the INFO transition lines make the switch
+    //   visible without a debug build, the per-ubatch lines are DEBUG, and the summary is printed
+    //   only when one batch actually ran at more than one depth (otherwise every decode step would
+    //   print it during generation). n_passes_log_last is a member so that the transition is also
+    //   reported when the switch happens between two decode() calls (prompt -> first generated token).
+    std::unordered_map<uint32_t, uint64_t> n_ubatch_by_depth;
+    std::unordered_map<uint32_t, uint64_t> n_tokens_by_depth;
+
     do {
         const auto & ubatch = mctx->get_ubatch();
+
+        {
+            // the effective depth, the same rule as graph_params(): a value deeper than the context
+            // default cannot be honored because the KV slots were sized for the default
+            const uint32_t n_passes_ub = ubatch.n_passes > 0 && ubatch.n_passes < cparams.n_passes
+                                       ? ubatch.n_passes : cparams.n_passes;
+
+            n_ubatch_by_depth[n_passes_ub]++;
+            n_tokens_by_depth[n_passes_ub] += ubatch.n_tokens;
+
+            if (n_passes_log_last != 0 && n_passes_ub != n_passes_log_last) {
+                LLAMA_LOG_INFO("%s: loop depth %u -> %u at n_tokens = %u (pos = [%d, %d])\n",
+                        __func__, n_passes_log_last, n_passes_ub, ubatch.n_tokens,
+                        ubatch.pos[0], ubatch.pos[ubatch.n_tokens - 1]);
+            } else {
+                LLAMA_LOG_DEBUG("%s: ubatch: n_passes = %u, n_tokens = %u (pos = [%d, %d])\n",
+                        __func__, n_passes_ub, ubatch.n_tokens,
+                        ubatch.pos[0], ubatch.pos[ubatch.n_tokens - 1]);
+            }
+            n_passes_log_last = n_passes_ub;
+        }
 
         // count the outputs in this ubatch
         {
@@ -2631,6 +2694,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 output_ids[out_ids[i]] = i;
             }
         }
+    }
+
+    if (n_ubatch_by_depth.size() > 1) {
+        std::string summary;
+        for (const auto & [n_passes_ub, n_ub] : n_ubatch_by_depth) {
+            if (!summary.empty()) {
+                summary += ", ";
+            }
+            summary += std::to_string(n_passes_ub) + " = " + std::to_string(n_ub) + " ubatch / "
+                     + std::to_string(n_tokens_by_depth[n_passes_ub]) + " tok";
+        }
+        LLAMA_LOG_INFO("%s: mixed loop depth in one batch: %s\n", __func__, summary.c_str());
     }
 
     // wait for the computation to finish (automatically done when obtaining the model output)
@@ -3082,9 +3157,19 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    // inkling2_loop: the ubatch can ask for a shallower depth than the context default. the depth is part of
+    //   the graph topology, so it travels in cparams of the params copy: the graph builder reads it and
+    //   llm_graph_params::allow_reuse rejects a graph built for another depth.
+    //   deeper than the context default is not possible - the KV slots were sized for the default.
+    llama_cparams cparams_ub = cparams;
+    if (ubatch.n_passes > 0 && ubatch.n_passes < cparams_ub.n_passes) {
+        cparams_ub.n_passes    = ubatch.n_passes;
+        cparams_ub.n_layer_use = model.hparams.n_layer_use(cparams_ub.n_passes);
+    }
+
     return {
         /*.model       =*/ &model,
-        /*.cparams     =*/ cparams,
+        /*.cparams     =*/ cparams_ub,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched.get(),
@@ -4654,6 +4739,14 @@ void llama_detach_threadpool(llama_context * ctx) {
 
 void llama_set_n_threads(llama_context * ctx, int32_t n_threads, int32_t n_threads_batch) {
     ctx->set_n_threads(n_threads, n_threads_batch);
+}
+
+void llama_set_loop_passes(llama_context * ctx, uint32_t n_passes) {
+    ctx->set_loop_passes(n_passes);
+}
+
+uint32_t llama_get_loop_passes(const llama_context * ctx) {
+    return ctx->get_loop_passes();
 }
 
 int32_t llama_n_threads(llama_context * ctx) {

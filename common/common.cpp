@@ -2343,9 +2343,18 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
         if (t.decision_group != 0 && !llama_batch_ext_set_decision_group(res, idx, t.decision_group)) {
             GGML_ABORT("%s: failed to set the decision group of the entry at index %d\n", __func__, i);
         }
+        if (t.n_passes != 0 && !llama_batch_ext_set_loop_passes(res, idx, t.n_passes)) {
+            GGML_ABORT("%s: failed to set the loop passes of the entry at index %d\n", __func__, i);
+        }
     }
 
     return res;
+}
+
+void common_batch::set_loop_passes(uint32_t n_passes) {
+    for (auto & t : tokens) {
+        t.n_passes = n_passes;
+    }
 }
 
 common_batch common_batch_get_one(llama_context * ctx, const llama_token * tokens, int32_t n_tokens) {

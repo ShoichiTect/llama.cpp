@@ -1098,6 +1098,15 @@ extern "C" {
 
     // TODO: implement get_embeddings() and get_logits() for llama_batch_ext
 
+    // inkling2_loop: set the number of passes over the looped core for the entry at index idx (0 = context default).
+    //   the depth is a property of the ubatch: an ubatch uses the depth of its first entry, so all entries
+    //   that land in the same ubatch must agree. values deeper than the context default are clamped to it,
+    //   because the KV slots were sized for the depth the context was created with.
+    LLAMA_API bool llama_batch_ext_set_loop_passes(
+                                struct llama_batch_ext * batch,
+                                               int32_t   idx,
+                                              uint32_t   n_passes);
+
     // Return values are the same as llama_decode()
     LLAMA_API int32_t llama_process(
                                 struct llama_context * ctx,
@@ -1108,6 +1117,11 @@ extern "C" {
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
     LLAMA_API void llama_set_n_threads(struct llama_context * ctx, int32_t n_threads, int32_t n_threads_batch);
+
+    // inkling2_loop: change the number of passes over the looped core at runtime (0 = the context default).
+    //   clamped to the model default; the KV slots of the dropped passes are left as they are (no repair)
+    LLAMA_API void     llama_set_loop_passes(struct llama_context * ctx, uint32_t n_passes);
+    LLAMA_API uint32_t llama_get_loop_passes(const struct llama_context * ctx);
 
     // Get the number of threads used for generation of a single token.
     LLAMA_API int32_t llama_n_threads(struct llama_context * ctx);

@@ -25,6 +25,7 @@
 #include "base64.hpp"
 
 #include <algorithm>
+#include <map>
 #include <cstddef>
 #include <cinttypes>
 #include <deque>
@@ -2087,6 +2088,10 @@ private:
         n_empty_consecutive = 0;
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
+        if (slot.task->params.n_loop_passes > 0) {
+            SLT_INF(slot, "loop_passes: decode = %d, prompt = %u (context depth, no repair)\n",
+                    slot.task->params.n_loop_passes, llama_get_loop_passes(ctx_tgt));
+        }
         return true;
     }
 
@@ -4646,6 +4651,48 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            // inkling2_loop: per-request depth. the prompt entries run at the depth the request asked for
+            //   (loop_passes_prompt, P5), else the context depth (--loop-passes); the generated ones run at
+            //   loop_passes, falling back to --loop-passes-decode. the depth travels on the batch entries
+            //   (1 ubatch = 1 depth), so no context state is mutated and the KV slots of the dropped passes
+            //   are left as they are (no repair). values deeper than the context default are clamped in
+            //   graph_params().
+            {
+                std::map<uint32_t, int32_t> n_tok_by_depth; // 0 = context default
+
+                for (int i = off; i < off + batch.view.size(); ++i) {
+                    const auto & t = batch.tokens[i];
+
+                    uint32_t n_passes = 0;
+                    const server_slot * slot_i = get_slot_by_id(t.id_slot);
+                    const task_params * tp = (slot_i != nullptr && slot_i->task) ? &slot_i->task->params : nullptr;
+                    if (tp != nullptr) {
+                        if (t.is_prompt) {
+                            if (tp->n_loop_passes_prompt > 0) {
+                                n_passes = (uint32_t) tp->n_loop_passes_prompt;
+                            }
+                        } else if (tp->n_loop_passes > 0) {
+                            n_passes = (uint32_t) tp->n_loop_passes;
+                        } else if (params_base.n_loop_passes_decode > 0) {
+                            n_passes = (uint32_t) params_base.n_loop_passes_decode;
+                        }
+                    }
+
+                    batch.view.tokens[i - off].n_passes = n_passes;
+                    n_tok_by_depth[n_passes] += 1;
+                }
+
+                if (!n_tok_by_depth.empty() && (n_tok_by_depth.size() > 1 || n_tok_by_depth.begin()->first != 0)) {
+                    std::string depths;
+                    for (const auto & [n_passes, n_tok] : n_tok_by_depth) {
+                        if (!depths.empty()) {
+                            depths += ", ";
+                        }
+                        depths += std::to_string(n_passes) + "x" + std::to_string(n_tok);
+                    }
+                    SRV_DBG("loop_passes per batch (0 = context default): %s\n", depths.c_str());
+                }
+            }
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);

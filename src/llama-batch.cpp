@@ -263,6 +263,10 @@ bool llama_batch_allocr::init(
             decision_group.resize(n_tok, 0);
             decision_group[i] = batch_inp.tokens[i].decision_group;
         }
+        if (batch_inp.tokens[i].n_passes != 0) {
+            n_passes.resize(n_tok, 0);
+            n_passes[i] = batch_inp.tokens[i].n_passes;
+        }
     }
 
     //
@@ -358,6 +362,7 @@ bool llama_batch_allocr::init(
             /*.type         =*/ is_embd_vec.empty() ? nullptr : is_embd_vec.data(),
             /*.decision_order =*/ decision_order.empty() ? nullptr : decision_order.data(),
             /*.decision_group =*/ decision_group.empty() ? nullptr : decision_group.data(),
+            /*.n_passes       =*/ 0,
             /*.data         =*/ {},
         };
 
@@ -585,6 +590,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.type         =*/ nullptr,
         /*.decision_order =*/ nullptr,
         /*.decision_group =*/ nullptr,
+        /*.n_passes     =*/ 0,
         /*.data         =*/ std::move(udata),
     };
 
@@ -894,6 +900,7 @@ void llama_batch_allocr::clear() {
     output      .clear();
     decision_order.clear();
     decision_group.clear();
+    n_passes   .clear();
 
     for (auto & cur : seq_pos) {
         cur.clear();
@@ -951,6 +958,18 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->type      .resize(mixed ? n_tokens : 0);
     udata->decision_order.resize(decision_order.empty() ? 0 : n_tokens);
     udata->decision_group.resize(decision_group.empty() ? 0 : n_tokens);
+
+    // inkling2_loop: 1 ubatch = 1 graph = 1 depth, so the ubatch takes the depth of its first entry
+    uint32_t n_passes_ub = n_passes.empty() ? 0 : n_passes[idxs[0]];
+    if (n_passes_ub > 0) {
+        for (size_t i = 1; i < idxs.size(); ++i) {
+            if (n_passes[idxs[i]] != n_passes_ub) {
+                LLAMA_LOG_WARN("%s: entries with different n_passes in one ubatch, using %u (first entry)\n",
+                        __func__, n_passes_ub);
+                break;
+            }
+        }
+    }
 
     udata->batch_idxs = idxs;
     udata->seq_id_data.reserve(n_tokens);
@@ -1042,6 +1061,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.type         =*/ mixed ? udata->type.data() : nullptr,
         /*.decision_order =*/ udata->decision_order.empty() ? nullptr : udata->decision_order.data(),
         /*.decision_group =*/ udata->decision_group.empty() ? nullptr : udata->decision_group.data(),
+        /*.n_passes     =*/ n_passes_ub,
         /*.data         =*/ std::move(udata),
     };
 
@@ -1450,6 +1470,14 @@ bool llama_batch_ext::set_decision_group(int32_t idx, int32_t group) {
     return true;
 }
 
+bool llama_batch_ext::set_loop_passes(int32_t idx, uint32_t n_passes) {
+    if (idx < 0 || idx >= (int32_t) tokens.size()) {
+        return false;
+    }
+    tokens[idx].n_passes = n_passes;
+    return true;
+}
+
 // llama_batch_ext C API
 
 llama_batch_ext * llama_batch_ext_init(llama_context * ctx) {
@@ -1535,6 +1563,10 @@ bool llama_batch_ext_set_decision_order(llama_batch_ext * batch, int32_t idx, ll
 
 bool llama_batch_ext_set_decision_group(llama_batch_ext * batch, int32_t idx, int32_t group) {
     return batch->set_decision_group(idx, group);
+}
+
+bool llama_batch_ext_set_loop_passes(llama_batch_ext * batch, int32_t idx, uint32_t n_passes) {
+    return batch->set_loop_passes(idx, n_passes);
 }
 
 // llama_batch_compat

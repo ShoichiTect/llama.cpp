@@ -100,7 +100,11 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template & 
     auto use_tools           = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
 
-    data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+    // some fine-tunes (varloop) emit HEADER + TOOL_JSON + {"name":..} and drop the name token that the
+    // native format puts between the two. With rescue_missing_name the parser also accepts that form and
+    // recovers the name from the "name" key of the arguments object. The grammar is always built from the
+    // tree without the rescue, so the emitted grammar (and therefore the native form) does not change.
+    auto build_parser = [&](common_chat_peg_builder & p, bool rescue_missing_name) -> common_peg_parser {
         auto header = p.literal(HEADER);
         auto end    = p.literal(END);
 
@@ -125,7 +129,18 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template & 
             const auto & function = tool.at("function");
             std::string  name     = function.at("name");
 
-            auto open = p.tool_name(p.literal(name)) + p.literal(TOOL_JSON) + p.literal("{\"name\":" + json(name).dump() + ",\"args\":");
+            const std::string name_json = json(name).dump();
+
+            auto open_named = p.tool_name(p.literal(name)) + p.literal(TOOL_JSON) +
+                              p.literal("{\"name\":" + name_json + ",\"args\":");
+            auto open = open_named;
+            if (rescue_missing_name) {
+                // HEADER + TOOL_JSON + {"name":"NAME","args":{...}} - NAME only exists inside the JSON
+                auto open_unnamed = p.literal(TOOL_JSON) + p.literal("{\"name\":\"") +
+                                    p.tool_name(p.literal(name_json.substr(1, name_json.size() - 2))) +
+                                    p.literal("\",\"args\":");
+                open = p.choice({ open_named, open_unnamed });
+            }
             auto args = p.tool_args(p.json());
 
             tool_choice |= p.rule("tool-" + std::to_string(tool_index), p.tool(p.tool_open(open) + args + p.tool_close(p.literal("}")) + end));
@@ -140,12 +155,16 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template & 
         }
 
         return blocks + p.optional(tool_calls);
-    });
+    };
+
+    data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) { return build_parser(p, true); });
 
     if (has_response_format || use_tools) {
         data.grammar_lazy = !has_response_format && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
-            data.parser.build_grammar(builder, data.grammar_lazy);
+            // built from the un-rescued tree: the grammar keeps requiring the native NAME + TOOL_JSON form
+            auto arena = build_chat_peg_parser([&](common_chat_peg_builder & p) { return build_parser(p, false); });
+            arena.build_grammar(builder, data.grammar_lazy);
         });
 
         if (data.grammar_lazy) {
